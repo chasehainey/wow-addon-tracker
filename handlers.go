@@ -10,7 +10,9 @@ import (
 
 // inDashboard returns true when the app is showing the main dashboard (no overlays).
 func (m model) inDashboard() bool {
-	return !m.browseInstallConfirm &&
+	return !m.confirmQuit &&
+		!m.viewBrowseDetail &&
+		!m.browseInstallConfirm &&
 		!m.inputAddRepo &&
 		!m.addRepoConfirm &&
 		!m.installing &&
@@ -39,7 +41,7 @@ func (m model) handleDashboard(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.browseDBFilterActive = false
 				m.browseDBFilter = ""
 				m.textInputBrowseFilter.Blur()
-				m.browseDBIndices = allDBIndices(m.addonDB)
+				m.browseDBIndices = m.browseCurIndices()
 				m.browseDBCursor = 0
 				return m, nil
 			case "enter":
@@ -51,7 +53,7 @@ func (m model) handleDashboard(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.textInputBrowseFilter, cmd = m.textInputBrowseFilter.Update(msg)
 		m.browseDBFilter = m.textInputBrowseFilter.Value()
-		m.browseDBIndices = computeBrowseFilter(m.browseDBFilter, m.addonDB)
+		m.browseDBIndices = m.browseCurIndices()
 		m.browseDBCursor = 0
 		return m, cmd
 	}
@@ -127,6 +129,7 @@ func (m model) handleDashboard(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(m.addonFilteredIndices) > 0 {
 				m.selectedAddonIdx = m.addonFilteredIndices[m.addonListCursor]
 				m.viewAddonDetail = true
+				m = setupChangelogViewport(m)
 			}
 		} else {
 			if len(m.browseDBIndices) == 0 {
@@ -138,11 +141,7 @@ func (m model) handleDashboard(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				idx := m.browseDBIndices[m.browseDBCursor]
 				entry := m.addonDB[idx]
-				m.pendingRepo = entry.Repo
-				m.addRepoFetching = true
-				m.loading = true
-				m.errorMsg = ""
-				return m, fetchLatestRelease(entry.Repo, m.config.GithubToken)
+				return m.startInstallFromEntry(entry)
 			}
 		}
 
@@ -165,6 +164,17 @@ func (m model) handleDashboard(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.browseDBFilterActive = true
 			m.textInputBrowseFilter.SetValue("")
 			m.textInputBrowseFilter.Focus()
+		}
+
+	case "1", "2", "3":
+		if m.dashboardFocus == "browse" {
+			tabs := []string{"all", "hot", "new"}
+			idx := int(keyMsg.String()[0] - '1')
+			if idx < len(tabs) {
+				m.browseTab = tabs[idx]
+				m.browseDBIndices = m.browseCurIndices()
+				m.browseDBCursor = 0
+			}
 		}
 
 	case "f":
@@ -190,7 +200,7 @@ func (m model) handleDashboard(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.config.Addons) > 0 {
 			m.checkingUpdates = true
 			m.loading = true
-			return m, checkAllAddons(m.config.Addons, m.config.GithubToken)
+			return m, checkAllAddons(m.config.Addons, m.addonDB, m.config.GithubToken)
 		}
 		m.errorMsg = "No addons tracked. Press [a] to add one."
 
@@ -201,14 +211,17 @@ func (m model) handleDashboard(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.config.Addons) > 0 {
 			m.updatingAll = true
 			m.loading = true
-			return m, checkAllAddons(m.config.Addons, m.config.GithubToken)
+			return m, checkAllAddons(m.config.Addons, m.addonDB, m.config.GithubToken)
 		}
 		m.errorMsg = "No addons tracked. Press [a] to add one."
 
 	case "r":
 		m.successMsg = ""
 		m.errorMsg = ""
-		return m, fetchRemoteDB()
+		m.dbRefreshing = true
+		m.rssHotLoaded = false
+		m.rssNewLoaded = false
+		return m, tea.Batch(refreshWoWInterfaceDB(m.addonDB), fetchWoWIRSS("hot"), fetchWoWIRSS("new"))
 
 	case "p":
 		m.viewProfiles = true
@@ -218,10 +231,59 @@ func (m model) handleDashboard(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewSettings = true
 		m.settingsCursor = 0
 
+	case "esc":
+		// Reset state: clear any filters, selections, and messages.
+		// If already in a clean state, show the quit confirmation popup.
+		anythingCleared := false
+		if m.addonListFilter != "" {
+			m.addonListFilter = ""
+			m.addonFilteredIndices = computeAddonFilter(m.defaultFlavor, "", m.config.Addons)
+			anythingCleared = true
+		}
+		if m.browseDBFilter != "" {
+			m.browseDBFilter = ""
+			m.browseDBIndices = m.browseCurIndices()
+			anythingCleared = true
+		}
+		if len(m.browseDBSelected) > 0 {
+			m.browseDBSelected = make(map[int]struct{})
+			anythingCleared = true
+		}
+		if m.errorMsg != "" || m.successMsg != "" {
+			m.errorMsg = ""
+			m.successMsg = ""
+			anythingCleared = true
+		}
+		if !anythingCleared {
+			m.confirmQuit = true
+			m.quitConfirmFocus = "no"
+		}
+
 	case "q":
-		return m, tea.Quit
+		m.confirmQuit = true
+		m.quitConfirmFocus = "no"
 	}
 
+	return m, nil
+}
+
+// handleQuitConfirm handles the quit confirmation popup.
+func (m model) handleQuitConfirm(keyMsg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch keyMsg.String() {
+	case "tab", "left", "right", "h", "l":
+		if m.quitConfirmFocus == "no" {
+			m.quitConfirmFocus = "yes"
+		} else {
+			m.quitConfirmFocus = "no"
+		}
+	case "enter":
+		if m.quitConfirmFocus == "yes" {
+			return m, tea.Quit
+		}
+		m.confirmQuit = false
+	case "esc":
+		m.confirmQuit = false
+	}
 	return m, nil
 }
 
@@ -272,6 +334,7 @@ func (m model) handleAddonList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.addonFilteredIndices) > 0 {
 			m.selectedAddonIdx = m.addonFilteredIndices[m.addonListCursor]
 			m.viewAddonDetail = true
+			m = setupChangelogViewport(m)
 		}
 	case "/":
 		m.addonFilterActive = true
@@ -281,13 +344,13 @@ func (m model) handleAddonList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !m.checkingUpdates && len(m.config.Addons) > 0 {
 			m.checkingUpdates = true
 			m.loading = true
-			return m, checkAllAddons(m.config.Addons, m.config.GithubToken)
+			return m, checkAllAddons(m.config.Addons, m.addonDB, m.config.GithubToken)
 		}
 	case "U":
 		if !m.checkingUpdates && len(m.config.Addons) > 0 {
 			m.updatingAll = true
 			m.loading = true
-			return m, checkAllAddons(m.config.Addons, m.config.GithubToken)
+			return m, checkAllAddons(m.config.Addons, m.addonDB, m.config.GithubToken)
 		}
 	case "a":
 		m.viewAddons = false
@@ -308,6 +371,19 @@ func (m model) handleAddonDetail(keyMsg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "u":
 		if m.selectedAddonIdx < len(m.config.Addons) {
 			addon := m.config.Addons[m.selectedAddonIdx]
+			if id := wowiIDFromKey(addon.GithubRepo); id > 0 {
+				for _, e := range m.addonDB {
+					if e.WoWInterfaceID == id {
+						release := wowiMakeRelease(e)
+						path := addonPath(m.config, addon.GameFlavor)
+						m.updatingSingle = true
+						m.loading = true
+						m.downloadProgress = 0.1
+						return m, tea.Batch(installAddon(addon.GithubRepo, release, path, "", addon.ExtractAs), downloadTick())
+					}
+				}
+				return m, nil
+			}
 			m.updatingSingle = true
 			m.loading = true
 			return m, fetchLatestRelease(addon.GithubRepo, m.config.GithubToken)
@@ -316,6 +392,18 @@ func (m model) handleAddonDetail(keyMsg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.confirmDelete = true
 	case "esc", "q":
 		m.viewAddonDetail = false
+	case "up", "k":
+		m.viewport.ScrollUp(1)
+	case "down", "j":
+		m.viewport.ScrollDown(1)
+	case "pgup", "b":
+		m.viewport.PageUp()
+	case "pgdown", "f", " ":
+		m.viewport.PageDown()
+	case "home", "g":
+		m.viewport.GotoTop()
+	case "end", "G":
+		m.viewport.GotoBottom()
 	}
 	return m, nil
 }
@@ -330,7 +418,7 @@ func (m model) handleBrowseDB(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.browseDBFilterActive = false
 				m.browseDBFilter = ""
 				m.textInputBrowseFilter.Blur()
-				m.browseDBIndices = allDBIndices(m.addonDB)
+				m.browseDBIndices = m.browseCurIndices()
 				m.browseDBCursor = 0
 				return m, nil
 			case "enter":
@@ -342,7 +430,7 @@ func (m model) handleBrowseDB(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.textInputBrowseFilter, cmd = m.textInputBrowseFilter.Update(msg)
 		m.browseDBFilter = m.textInputBrowseFilter.Value()
-		m.browseDBIndices = computeBrowseFilter(m.browseDBFilter, m.addonDB)
+		m.browseDBIndices = m.browseCurIndices()
 		m.browseDBCursor = 0
 		return m, cmd
 	}
@@ -383,21 +471,51 @@ func (m model) handleBrowseDB(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.browseInstallConfirm = true
 			m.browseInstallFlavor = "retail"
 		} else {
-			// Single install — full review flow
+			// Open detail view for the current cursor item
 			idx := m.browseDBIndices[m.browseDBCursor]
-			entry := m.addonDB[idx]
-			m.viewBrowseDB = false
-			m.pendingRepo = entry.Repo
-			m.addRepoFetching = true
-			m.loading = true
-			m.errorMsg = ""
-			return m, fetchLatestRelease(entry.Repo, m.config.GithubToken)
+			m.selectedBrowseDBIdx = idx
+			m.viewBrowseDetail = true
+			m = setupBrowseDetailViewport(m)
+		}
+	case "1", "2", "3":
+		tabs := []string{"all", "hot", "new"}
+		idx := int(keyMsg.String()[0] - '1')
+		if idx < len(tabs) {
+			m.browseTab = tabs[idx]
+			m.browseDBIndices = m.browseCurIndices()
+			m.browseDBCursor = 0
 		}
 	case "esc", "q":
 		m.viewBrowseDB = false
 		m.browseDBFilter = ""
 		m.browseDBFilterActive = false
 		m.browseDBSelected = make(map[int]struct{})
+	}
+	return m, nil
+}
+
+// handleBrowseDetail handles input in the Browse addon detail view.
+func (m model) handleBrowseDetail(msg tea.Msg) (tea.Model, tea.Cmd) {
+	keyMsg, ok := msg.(tea.KeyPressMsg)
+	if !ok {
+		// Pass scroll events to viewport.
+		var cmd tea.Cmd
+		m.viewport, cmd = m.viewport.Update(msg)
+		return m, cmd
+	}
+	switch keyMsg.String() {
+	case "i", "enter":
+		if m.selectedBrowseDBIdx < len(m.addonDB) {
+			entry := m.addonDB[m.selectedBrowseDBIdx]
+			m.viewBrowseDetail = false
+			return m.startInstallFromEntry(entry)
+		}
+	case "k", "up":
+		m.viewport.ScrollUp(1)
+	case "j", "down":
+		m.viewport.ScrollDown(1)
+	case "esc", "q":
+		m.viewBrowseDetail = false
 	}
 	return m, nil
 }
@@ -415,7 +533,12 @@ func (m model) handleBrowseInstallConfirm(keyMsg tea.KeyPressMsg) (tea.Model, te
 		// Build install queue from selected db indices
 		m.browseInstallQueue = nil
 		for idx := range m.browseDBSelected {
-			m.browseInstallQueue = append(m.browseInstallQueue, m.addonDB[idx].Repo)
+			e := m.addonDB[idx]
+			if e.WoWInterfaceID > 0 {
+				m.browseInstallQueue = append(m.browseInstallQueue, wowiKeyFromID(e.WoWInterfaceID))
+			} else if e.Repo != "" {
+				m.browseInstallQueue = append(m.browseInstallQueue, e.Repo)
+			}
 		}
 		if len(m.browseInstallQueue) == 0 {
 			m.browseInstallConfirm = false
@@ -425,7 +548,7 @@ func (m model) handleBrowseInstallConfirm(keyMsg tea.KeyPressMsg) (tea.Model, te
 		m.browseInstalling = true
 		m.browseInstallIdx = 0
 		m.loading = true
-		return m, fetchLatestRelease(m.browseInstallQueue[0], m.config.GithubToken)
+		return m, m.nextBrowseInstallCmd()
 	case "esc":
 		m.browseInstallConfirm = false
 	}
@@ -446,7 +569,11 @@ func (m model) handleAddRepoInput(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "tab":
 			if len(m.dbSuggestions) > 0 {
 				m.dbSuggestionIdx = (m.dbSuggestionIdx + 1) % len(m.dbSuggestions)
-				m.textInputRepo.SetValue(m.dbSuggestions[m.dbSuggestionIdx].Repo)
+				e := m.dbSuggestions[m.dbSuggestionIdx]
+				if e.WoWInterfaceID > 0 {
+					return m.startInstallFromEntry(e)
+				}
+				m.textInputRepo.SetValue(e.Repo)
 				m.dbSuggestions = computeDBSuggestions(m.textInputRepo.Value(), m.addonDB)
 			}
 			return m, nil
@@ -744,6 +871,24 @@ func (m model) handleSettingsClassicInput(msg tea.Msg) (tea.Model, tea.Cmd) {
 // It mirrors the mode routing in Update() and directly performs the relevant action.
 func (m model) handleMouseClick(msg tea.MouseReleaseMsg) (tea.Model, tea.Cmd) {
 	switch {
+	// --- Browse detail view ---
+	case m.viewBrowseDetail:
+		if zone.Get("browse-detail-install").InBounds(msg) {
+			if m.selectedBrowseDBIdx < len(m.addonDB) {
+				entry := m.addonDB[m.selectedBrowseDBIdx]
+				m.viewBrowseDetail = false
+				return m.startInstallFromEntry(entry)
+			}
+		}
+
+	// --- Quit confirm ---
+	case m.confirmQuit:
+		if zone.Get("quit-yes").InBounds(msg) {
+			return m, tea.Quit
+		} else if zone.Get("quit-no").InBounds(msg) {
+			m.confirmQuit = false
+		}
+
 	// --- Browse batch install confirm ---
 	case m.browseInstallConfirm:
 		if zone.Get("browse-flavor-retail").InBounds(msg) {
@@ -797,6 +942,19 @@ func (m model) handleMouseClick(msg tea.MouseReleaseMsg) (tea.Model, tea.Cmd) {
 		if zone.Get("detail-update").InBounds(msg) {
 			if m.selectedAddonIdx < len(m.config.Addons) {
 				addon := m.config.Addons[m.selectedAddonIdx]
+				if id := wowiIDFromKey(addon.GithubRepo); id > 0 {
+					for _, e := range m.addonDB {
+						if e.WoWInterfaceID == id {
+							release := wowiMakeRelease(e)
+							path := addonPath(m.config, addon.GameFlavor)
+							m.updatingSingle = true
+							m.loading = true
+							m.downloadProgress = 0.1
+							return m, tea.Batch(installAddon(addon.GithubRepo, release, path, "", addon.ExtractAs), downloadTick())
+						}
+					}
+					return m, nil
+				}
 				m.updatingSingle = true
 				m.loading = true
 				return m, fetchLatestRelease(addon.GithubRepo, m.config.GithubToken)
@@ -860,6 +1018,9 @@ func (m model) handleMouseClick(msg tea.MouseReleaseMsg) (tea.Model, tea.Cmd) {
 	case m.inputAddRepo && !m.addRepoFetching:
 		for i, e := range m.dbSuggestions {
 			if zone.Get(fmt.Sprintf("suggest-%d", i)).InBounds(msg) {
+				if e.WoWInterfaceID > 0 {
+					return m.startInstallFromEntry(e)
+				}
 				m.textInputRepo.SetValue(e.Repo)
 				m.dbSuggestionIdx = i
 				m.dbSuggestions = computeDBSuggestions(e.Repo, m.addonDB)
@@ -883,26 +1044,24 @@ func (m model) handleMouseClick(msg tea.MouseReleaseMsg) (tea.Model, tea.Cmd) {
 							m.selectedAddonIdx = m.addonFilteredIndices[listPos]
 							m.addonListCursor = listPos
 							m.viewAddonDetail = true
+							m = setupChangelogViewport(m)
 						}
 						break
 					}
 				}
 			}
-			// Browse panel row clicks:
-			// first click switches focus; clicking when already focused toggles selection.
+			// Browse panel row clicks: first click focuses + moves cursor; second click opens detail.
 			if !m.browseDBFilterActive {
 				for listPos, idx := range m.browseDBIndices {
 					if zone.Get(fmt.Sprintf("browse-row-%d", listPos)).InBounds(msg) {
-						if m.dashboardFocus != "browse" {
+						if m.dashboardFocus != "browse" || m.browseDBCursor != listPos {
 							m.dashboardFocus = "browse"
 							m.browseDBCursor = listPos
 						} else {
-							if _, selected := m.browseDBSelected[idx]; selected {
-								delete(m.browseDBSelected, idx)
-							} else {
-								m.browseDBSelected[idx] = struct{}{}
-							}
-							m.browseDBCursor = listPos
+							// Already on this row — open detail.
+							m.selectedBrowseDBIdx = idx
+							m.viewBrowseDetail = true
+							m = setupBrowseDetailViewport(m)
 						}
 						break
 					}
@@ -918,6 +1077,28 @@ func (m model) handleMouseClick(msg tea.MouseReleaseMsg) (tea.Model, tea.Cmd) {
 				m.addonFilteredIndices = computeAddonFilter("classic", m.addonListFilter, m.config.Addons)
 				m.addonListCursor = 0
 			}
+			// Browse flavor tab clicks (Retail / Classic)
+			if zone.Get("browse-flavor-tab-retail").InBounds(msg) {
+				m.dashboardFocus = "browse"
+				m.browseFlavor = "retail"
+				m.browseDBIndices = m.browseCurIndices()
+				m.browseDBCursor = 0
+			} else if zone.Get("browse-flavor-tab-classic").InBounds(msg) {
+				m.dashboardFocus = "browse"
+				m.browseFlavor = "classic"
+				m.browseDBIndices = m.browseCurIndices()
+				m.browseDBCursor = 0
+			}
+			// Browse tab clicks (All / Hot / New)
+			for _, tabID := range []string{"all", "hot", "new"} {
+				if zone.Get("browse-tab-"+tabID).InBounds(msg) {
+					m.dashboardFocus = "browse"
+					m.browseTab = tabID
+					m.browseDBIndices = m.browseCurIndices()
+					m.browseDBCursor = 0
+					break
+				}
+			}
 			// Sidebar action buttons
 			sidebarActions := []string{"c", "U", "a", "p", "s", "q"}
 			for i := range sidebarActions {
@@ -927,13 +1108,13 @@ func (m model) handleMouseClick(msg tea.MouseReleaseMsg) (tea.Model, tea.Cmd) {
 						if len(m.config.Addons) > 0 {
 							m.checkingUpdates = true
 							m.loading = true
-							return m, checkAllAddons(m.config.Addons, m.config.GithubToken)
+							return m, checkAllAddons(m.config.Addons, m.addonDB, m.config.GithubToken)
 						}
 					case "U":
 						if len(m.config.Addons) > 0 {
 							m.updatingAll = true
 							m.loading = true
-							return m, checkAllAddons(m.config.Addons, m.config.GithubToken)
+							return m, checkAllAddons(m.config.Addons, m.addonDB, m.config.GithubToken)
 						}
 					case "a":
 						m.inputAddRepo = true
@@ -963,6 +1144,12 @@ func (m model) handleMouseWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd) {
 	up := msg.Button == tea.MouseWheelUp
 
 	switch {
+	case m.viewAddonDetail || m.viewBrowseDetail:
+		if down {
+			m.viewport.ScrollDown(3)
+		} else if up {
+			m.viewport.ScrollUp(3)
+		}
 	case m.viewProfiles && !m.viewProfileDetail && !m.inputNewProfile:
 		if down && m.profileListCursor < len(m.config.Profiles)-1 {
 			m.profileListCursor++
@@ -996,6 +1183,33 @@ func (m model) handleMouseWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd) {
 				m.browseDBCursor--
 			}
 		}
+	}
+	return m, nil
+}
+
+// startInstallFromEntry begins an install for a DB entry.
+// WoWInterface entries go straight to the confirm screen.
+// GitHub entries fetch the latest release first.
+func (m model) startInstallFromEntry(entry AddonDBEntry) (model, tea.Cmd) {
+	if entry.WoWInterfaceID > 0 {
+		release := wowiMakeRelease(entry)
+		m.pendingRepo = wowiKeyFromID(entry.WoWInterfaceID)
+		m.pendingRelease = &release
+		m.pendingFlavor = m.defaultFlavor
+		m.pendingExtractAs = entry.ExtractAs
+		m.inputAddRepo = false
+		m.addRepoConfirm = true
+		return m, nil
+	}
+	if entry.Repo != "" {
+		m.pendingRepo = entry.Repo
+		m.addRepoFetching = true
+		m.loading = true
+		m.errorMsg = ""
+		m.inputAddRepo = false
+		m.dbSuggestions = nil
+		m.dbSuggestionIdx = -1
+		return m, fetchLatestRelease(entry.Repo, m.config.GithubToken)
 	}
 	return m, nil
 }

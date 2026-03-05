@@ -114,8 +114,30 @@ var browseDBKeys = browseDBKeyMap{
 	Down:   key.NewBinding(key.WithKeys("j", "down"), key.WithHelp("↓/j", "down")),
 	Select: key.NewBinding(key.WithKeys("space"), key.WithHelp("space", "select")),
 	Filter: key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter")),
-	Enter:  key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "install")),
+	Enter:  key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "view")),
 	Back:   key.NewBinding(key.WithKeys("esc", "q"), key.WithHelp("esc", "back")),
+}
+
+// browseDetailKeyMap is the key map for the Browse addon detail view.
+type browseDetailKeyMap struct {
+	Install key.Binding
+	ScrollU key.Binding
+	ScrollD key.Binding
+	Back    key.Binding
+}
+
+func (k browseDetailKeyMap) ShortHelp() []key.Binding {
+	return []key.Binding{k.Install, k.ScrollU, k.ScrollD, k.Back}
+}
+func (k browseDetailKeyMap) FullHelp() [][]key.Binding {
+	return [][]key.Binding{{k.Install, k.ScrollU, k.ScrollD, k.Back}}
+}
+
+var browseDetailKeys = browseDetailKeyMap{
+	Install: key.NewBinding(key.WithKeys("i", "enter"), key.WithHelp("i/enter", "install")),
+	ScrollU: key.NewBinding(key.WithKeys("k", "up"), key.WithHelp("↑/k", "scroll up")),
+	ScrollD: key.NewBinding(key.WithKeys("j", "down"), key.WithHelp("↓/j", "scroll down")),
+	Back:    key.NewBinding(key.WithKeys("esc", "q"), key.WithHelp("esc", "back")),
 }
 
 // profileListKeyMap is the key map for the profile list.

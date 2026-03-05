@@ -38,12 +38,16 @@ func fetchLatestReleaseSync(repo, token string) (GitHubRelease, error) {
 
 	if formalErr != nil && tagErr != nil {
 		// No releases and no tags — fall back to the default branch zipball.
-		// Use the latest commit date as a version string so the UI shows
-		// something meaningful instead of "HEAD".
-		zipURL := fmt.Sprintf("%s/repos/%s/zipball", githubAPIBase, repo)
-		tagName := fetchLatestCommitDate(repo, token)
+		// Pin the download to the specific commit SHA so we don't always pull
+		// HEAD, and use the commit date as the displayed version string.
+		sha, date := fetchLatestCommit(repo, token)
+		tagName := date
 		if tagName == "" {
 			tagName = "HEAD"
+		}
+		zipURL := fmt.Sprintf("%s/repos/%s/zipball", githubAPIBase, repo)
+		if sha != "" {
+			zipURL = fmt.Sprintf("%s/repos/%s/zipball/%s", githubAPIBase, repo, sha)
 		}
 		return GitHubRelease{TagName: tagName, ZipballURL: zipURL}, nil
 	}
@@ -53,15 +57,68 @@ func fetchLatestReleaseSync(repo, token string) (GitHubRelease, error) {
 	if tagErr != nil {
 		return formal, nil
 	}
-	// Both found — compare by tag name using version-aware ordering.
-	// tagIsNewer correctly handles repos like Details that use date-stamped
-	// tags (e.g. "Details.20260304...") alongside old semver formal releases
-	// (e.g. "DetailsRetail.v9.1.0...") without relying on PublishedAt dates,
-	// which can be stale or missing when releases are attached to old tags.
-	if tagIsNewer(tag.TagName, formal.TagName) {
+	// Both found — compare using dates embedded in the tag names, with a
+	// careful fallback to PublishedAt when only one side has a dated tag.
+	//
+	// Repos like Details-Damage-Meter use date-stamped tags ("Details.20260304…")
+	// as their canonical versioning while also publishing formal "Release_N"
+	// releases.  The formal release's PublishedAt may be one day after the tag
+	// date (packaging delay), but the date-stamped tag IS the right version.
+	// Conversely, repos that switched FROM date tags TO semver should use the
+	// semver formal release, which will have a PublishedAt years after the old
+	// date tags.
+	//
+	// Decision rules (tagTagDate / formalTagDate are YYYYMMDD from tag names):
+	//  1. Both have date tags  → compare YYYYMMDD; newer wins.
+	//  2. Only tag has date    → if formal.PublishedAt is from the same year or
+	//                            an earlier year, the date-tagged style is canonical:
+	//                            prefer tag.  If formal is from a later year, the
+	//                            repo switched versioning → prefer formal.
+	//  3. Only formal has date → mirror of case 2.
+	//  4. Neither has date     → fall back to compareTagVersions.
+	tagTagDate := extractTagDate(tag.TagName)
+	formalTagDate := extractTagDate(formal.TagName)
+
+	switch {
+	case tagTagDate != "" && formalTagDate != "":
+		// Both date-stamped: the later date wins.
+		if tagTagDate >= formalTagDate {
+			return tag, nil
+		}
+		return formal, nil
+
+	case tagTagDate != "" && formalTagDate == "":
+		// Tag is date-stamped; formal is not (e.g. "Release_1234", "v3.0.0").
+		// If the formal's publication year is strictly later than the tag's year,
+		// the repo has switched away from date-stamped versioning → prefer formal.
+		// Otherwise the date-stamped tag is the canonical version → prefer tag.
+		formalPubYear := ""
+		if len(formal.PublishedAt) >= 4 {
+			formalPubYear = formal.PublishedAt[:4]
+		}
+		if formalPubYear != "" && formalPubYear > tagTagDate[:4] {
+			return formal, nil
+		}
 		return tag, nil
+
+	case tagTagDate == "" && formalTagDate != "":
+		// Formal is date-stamped; tag is not.  Mirror of the case above.
+		tagPubYear := ""
+		if len(tag.PublishedAt) >= 4 {
+			tagPubYear = tag.PublishedAt[:4]
+		}
+		if tagPubYear != "" && tagPubYear > formalTagDate[:4] {
+			return tag, nil
+		}
+		return formal, nil
+
+	default:
+		// Neither has a date tag — fall back to tag name version comparison.
+		if tagIsNewer(tag.TagName, formal.TagName) {
+			return tag, nil
+		}
+		return formal, nil
 	}
-	return formal, nil
 }
 
 // fetchBestFormalRelease returns the best formal GitHub release (via
@@ -80,9 +137,10 @@ func fetchBestFormalRelease(repo, token string) (GitHubRelease, error) {
 		var latest GitHubRelease
 		if err := json.Unmarshal(body, &latest); err == nil {
 			// The "latest" marker may lag; compare with the most-recently
-			// published release and use whichever is newer.
+			// published release and use whichever is newer — but never let
+			// a pre-release displace the stable "latest".
 			if recent, err := fetchMostRecentRelease(repo, token); err == nil {
-				if recent.PublishedAt > latest.PublishedAt {
+				if !recent.Prerelease && recent.PublishedAt > latest.PublishedAt {
 					return recent, nil
 				}
 			}
@@ -402,21 +460,22 @@ func fetchChangelogVersion(repo, token string) string {
 	return ""
 }
 
-// fetchLatestCommitDate returns the committer date of the most recent commit
-// on the default branch as "YYYY-MM-DD", or "" on any failure.  Used as a
-// last-resort version string for repos that have no releases and no tags.
-func fetchLatestCommitDate(repo, token string) string {
+// fetchLatestCommit returns the SHA and committer date ("YYYY-MM-DD") of the
+// most recent commit on the default branch.  Used as a last resort for repos
+// that have no releases and no tags.  Both values are "" on any failure.
+func fetchLatestCommit(repo, token string) (sha, date string) {
 	url := fmt.Sprintf("%s/repos/%s/commits?per_page=1", githubAPIBase, repo)
 	resp, err := githubRequest(url, token)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if err != nil || resp.StatusCode != 200 {
-		return ""
+		return "", ""
 	}
 	var commits []struct {
+		SHA    string `json:"sha"`
 		Commit struct {
 			Committer struct {
 				Date string `json:"date"`
@@ -424,13 +483,16 @@ func fetchLatestCommitDate(repo, token string) string {
 		} `json:"commit"`
 	}
 	if err := json.Unmarshal(body, &commits); err != nil || len(commits) == 0 {
-		return ""
+		return "", ""
 	}
+	sha = commits[0].SHA
 	d := commits[0].Commit.Committer.Date
 	if len(d) >= 10 {
-		return d[:10] // YYYY-MM-DD
+		date = d[:10] // YYYY-MM-DD
+	} else {
+		date = d
 	}
-	return d
+	return sha, date
 }
 
 func fetchLatestRelease(repo, token string) tea.Cmd {
@@ -444,10 +506,18 @@ func normalizeVersion(v string) string {
 	return strings.TrimPrefix(v, "v")
 }
 
-func checkAllAddons(addons []TrackedAddon, token string) tea.Cmd {
+func checkAllAddons(addons []TrackedAddon, db []AddonDBEntry, token string) tea.Cmd {
 	return func() tea.Msg {
 		if len(addons) == 0 {
 			return batchCheckCompleteMsg{results: []AddonWithStatus{}}
+		}
+
+		// Build a WoWInterface ID → DB entry lookup for fast version checks.
+		wowiMap := make(map[int]AddonDBEntry, len(db))
+		for _, e := range db {
+			if e.WoWInterfaceID > 0 {
+				wowiMap[e.WoWInterfaceID] = e
+			}
 		}
 
 		type result struct {
@@ -464,6 +534,17 @@ func checkAllAddons(addons []TrackedAddon, token string) tea.Cmd {
 			wg.Add(1)
 			go func(idx int, a TrackedAddon) {
 				defer wg.Done()
+				// WoWInterface addons: look up latest version from the DB
+				// (already fetched at startup) — no GitHub API call needed.
+				if id := wowiIDFromKey(a.GithubRepo); id > 0 {
+					if e, ok := wowiMap[id]; ok && e.LatestVersion != "" {
+						results[idx] = result{idx: idx, release: GitHubRelease{
+							TagName:     e.LatestVersion,
+							PublishedAt: e.LatestDate,
+						}}
+					}
+					return
+				}
 				sem <- struct{}{}
 				defer func() { <-sem }()
 				release, err := fetchLatestReleaseSync(a.GithubRepo, token)
@@ -481,14 +562,27 @@ func checkAllAddons(addons []TrackedAddon, token string) tea.Cmd {
 			if r.err != nil {
 				aws.Status = StatusUnknown
 			} else {
-				aws.LatestVersion = r.release.TagName
-				aws.LatestDate = r.release.PublishedAt
-				// Persist latest version on the addon so it survives app restarts.
-				aws.Addon.LatestVersion = r.release.TagName
-				aws.Addon.LatestDate = r.release.PublishedAt
-				if addon.InstalledVersion == "" {
+				latestTag := r.release.TagName
+				// Only update persisted version data when we got a real tag.
+				// "HEAD" means the repo has no releases/tags; don't overwrite
+				// a previously-known good version with it.
+				if latestTag != "" && latestTag != "HEAD" {
+					aws.LatestVersion = latestTag
+					aws.LatestDate = r.release.PublishedAt
+					aws.Addon.LatestVersion = latestTag
+					aws.Addon.LatestDate = r.release.PublishedAt
+				}
+				// Compare against the best version we know: freshly fetched,
+				// or the value persisted from a previous successful check.
+				effectiveLatest := aws.LatestVersion
+				if effectiveLatest == "" {
+					effectiveLatest = addon.LatestVersion
+				}
+				if effectiveLatest == "" || effectiveLatest == "HEAD" {
+					aws.Status = StatusUnknown
+				} else if addon.InstalledVersion == "" {
 					aws.Status = StatusNotInstalled
-				} else if normalizeVersion(addon.InstalledVersion) == normalizeVersion(r.release.TagName) {
+				} else if normalizeVersion(addon.InstalledVersion) == normalizeVersion(effectiveLatest) {
 					aws.Status = StatusUpToDate
 				} else {
 					aws.Status = StatusUpdateAvail

@@ -9,17 +9,17 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	lgtable "charm.land/lipgloss/v2/table"
+	"github.com/charmbracelet/x/ansi"
 	zone "github.com/lrstanley/bubblezone/v2"
 )
 
-// watLogo is the 6-line block-art logo shown in the header on large terminals.
-var watLogo = []string{
-	" ██╗    ██╗ █████╗ ████████╗",
-	" ██║    ██║██╔══██╗╚══██╔══╝",
-	" ██║ █╗ ██║███████║   ██║   ",
-	" ██║███╗██║██╔══██║   ██║   ",
-	" ╚███╔███╔╝██║  ██║   ██║   ",
-	"  ╚══╝╚══╝ ╚═╝  ╚═╝   ╚═╝  ",
+// watBanner is the 5-line full-width block-art banner "WOW ADDON TRACKER".
+var watBanner = []string{
+	"█   █  ███  █   █      ███  ████  ████   ███  █   █     █████ ████   ███   ████ █  █  █████ ████  ",
+	"█   █ █   █ █   █     █   █ █   █ █   █ █   █ ██  █       █   █   █ █   █ █     █ █   █     █   █ ",
+	"█ █ █ █   █ █ █ █     █████ █   █ █   █ █   █ █ █ █       █   ████  █████ █     ██    ████  ████  ",
+	"██ ██ █   █ ██ ██     █   █ █   █ █   █ █   █ █  ██       █   █  █  █   █ █     █ █   █     █  █  ",
+	"█   █  ███  █   █     █   █ ████  ████   ███  █   █       █   █   █ █   █  ████ █  █  █████ █   █ ",
 }
 
 func (m model) View() tea.View {
@@ -31,6 +31,12 @@ func (m model) View() tea.View {
 }
 
 func (m model) render() string {
+	// Before the first WindowSizeMsg we have no terminal dimensions — show a
+	// blank initializing screen to avoid a scrunched layout flash.
+	if !m.viewportReady {
+		return "  Initializing...\n"
+	}
+
 	var sb strings.Builder
 
 	sb.WriteString(m.renderHeader())
@@ -43,6 +49,8 @@ func (m model) render() string {
 	}
 
 	switch {
+	case m.viewBrowseDetail:
+		sb.WriteString(m.renderBrowseDetail())
 	case m.browseInstallConfirm:
 		sb.WriteString(m.renderBrowseInstallConfirm())
 	case m.inputAddRepo:
@@ -76,6 +84,8 @@ func (m model) render() string {
 	// Determine which keymap to show in the footer
 	var km help.KeyMap
 	switch {
+	case m.viewBrowseDetail:
+		km = browseDetailKeys
 	case m.viewAddonDetail:
 		km = addonDetailKeys
 	case m.viewProfiles && !m.viewProfileDetail && !m.inputNewProfile:
@@ -90,7 +100,54 @@ func (m model) render() string {
 		km = dashboardKeys
 	}
 	sb.WriteString(m.renderFooter(km))
-	return sb.String()
+	result := sb.String()
+	if m.confirmQuit {
+		return placeCentered(result, m.renderQuitConfirm(), m.terminalWidth, m.terminalHeight)
+	}
+	return result
+}
+
+// placeCentered composites a popup string centered over the base screen content.
+// Each line that the popup occupies is rebuilt as:
+//
+//	left_bg_chars + popup_line + right_bg_chars
+//
+// using ANSI-aware truncation so existing styling on the background is preserved.
+func placeCentered(base, popup string, termW, termH int) string {
+	baseLines := strings.Split(base, "\n")
+	popLines := strings.Split(strings.TrimRight(popup, "\n"), "\n")
+
+	popH := len(popLines)
+	popW := 0
+	for _, l := range popLines {
+		if w := lipgloss.Width(l); w > popW {
+			popW = w
+		}
+	}
+
+	startRow := (termH - popH) / 2
+	startCol := (termW - popW) / 2
+	if startRow < 0 {
+		startRow = 0
+	}
+	if startCol < 0 {
+		startCol = 0
+	}
+
+	for len(baseLines) <= startRow+popH {
+		baseLines = append(baseLines, "")
+	}
+
+	for i, popLine := range popLines {
+		row := startRow + i
+		bg := baseLines[row]
+		// Left: background up to startCol, right: background from startCol+popW onward.
+		left := ansi.Truncate(bg, startCol, "")
+		right := ansi.TruncateLeft(bg, startCol+popW, "")
+		baseLines[row] = left + popLine + right
+	}
+
+	return strings.Join(baseLines, "\n")
 }
 
 // ── Header ───────────────────────────────────────────────────────────────────
@@ -125,26 +182,21 @@ func (m model) renderHeader() string {
 		Render("  " + strings.Repeat("─", max(0, w-4)))
 
 	if m.terminalHeight >= 26 {
-		// Large terminal: 6-line block-art WAT logo.
-		// "WoW Addon Tracker" appears inline on the last logo line; stats right-aligned.
+		// Large terminal: 5-line full-width block-art "WoW Addon Tracker" banner.
 		logoStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(m.theme.Primary))
-		subtitleSty := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(m.theme.Secondary))
 		var out strings.Builder
-		// Lines 0–4: plain logo
-		for _, line := range watLogo[:5] {
+		for _, line := range watBanner {
 			out.WriteString(logoStyle.Render(line) + "\n")
 		}
-		// Line 5: last logo glyph + subtitle inline + right-aligned stats
-		lastLogo := logoStyle.Render(watLogo[5])
-		subtitle := subtitleSty.Render("  WoW Addon Tracker")
-		logoW := lipgloss.Width(lastLogo)
-		subW := lipgloss.Width(subtitle)
-		statsW := lipgloss.Width(statsStr)
-		gap := w - logoW - subW - statsW - 2
-		if gap < 1 {
-			gap = 1
+		// Stats line below the banner, right-aligned
+		if statsStr != "" {
+			statsW := lipgloss.Width(statsStr)
+			gap := w - statsW - 2
+			if gap < 1 {
+				gap = 1
+			}
+			out.WriteString(strings.Repeat(" ", gap) + statsStr + "\n")
 		}
-		out.WriteString(lastLogo + subtitle + strings.Repeat(" ", gap) + statsStr + "\n")
 		out.WriteString(divider)
 		return out.String()
 	}
@@ -195,7 +247,7 @@ func (m model) renderDashboard() string {
 		h = 24
 	}
 
-	// Content overhead: large header (h>=26) = 7 header + 1 blank + 2 footer = 10
+	// Content overhead: large header (h>=26) = 5 banner + 1 stats + 1 divider + 1 blank + 2 footer = 10
 	// Small header = 2 header + 1 blank + 2 footer = 5
 	overhead := 5
 	if h >= 26 {
@@ -206,39 +258,41 @@ func (m model) renderDashboard() string {
 		contentH = 10
 	}
 
-	// Sidebar width
-	sidebarOuterW := 26
-	if w > 110 {
-		sidebarOuterW = 30
+	// Width split: installed panel takes 3/4, info panel takes 1/4.
+	infoOuterW := w / 4
+	if infoOuterW < 22 {
+		infoOuterW = 22
 	}
-	leftOuterW := w - sidebarOuterW
-	if leftOuterW < 30 {
-		leftOuterW = 30
+	if infoOuterW > 36 {
+		infoOuterW = 36
 	}
+	installedOuterW := w - infoOuterW
 
-	// The tab row above the installed panel occupies 2 lines (border top + content).
-	// Subtract those from the available height before splitting installed vs browse.
+	// Height split: top row (installed + info panel) and bottom browse panel.
+	// tabRowH = 2: one row per tab strip.
+	// Three tab strips total: flavor (above installed), browse flavor (Retail/Classic),
+	// and browse kind (All/Hot/New) — the latter two are above the browse panel.
 	const tabRowH = 2
-	availH := contentH - tabRowH
-	if availH < 8 {
-		availH = 8
+	topRowH := contentH / 2
+	if topRowH < 6 {
+		topRowH = 6
 	}
-	installedOuterH := availH / 3
-	if installedOuterH < 4 {
-		installedOuterH = 4
-	}
-	browseOuterH := availH - installedOuterH
+	browseOuterH := contentH - topRowH - tabRowH*3
 	if browseOuterH < 4 {
 		browseOuterH = 4
 	}
 
-	tabs := m.renderFlavorTabs(leftOuterW)
-	installed := m.renderInstalledPanel(leftOuterW, installedOuterH)
-	browse := m.renderBrowsePanel(leftOuterW, browseOuterH)
-	left := lipgloss.JoinVertical(lipgloss.Top, tabs, installed, browse)
-	sidebar := m.renderSidebar(sidebarOuterW, contentH)
+	flavorTabs := m.renderFlavorTabs(installedOuterW)
+	installed := m.renderInstalledPanel(installedOuterW, topRowH)
+	info := m.renderSidebar(infoOuterW, topRowH+tabRowH)
+	topRow := lipgloss.JoinHorizontal(lipgloss.Top,
+		lipgloss.JoinVertical(lipgloss.Top, flavorTabs, installed),
+		info)
+	browseFlavorTabs := m.renderBrowseFlavorTabs(w)
+	browseTabs := m.renderBrowseTabs(w)
+	browse := m.renderBrowsePanel(w, browseOuterH)
 
-	return lipgloss.JoinHorizontal(lipgloss.Top, left, sidebar) + "\n"
+	return lipgloss.JoinVertical(lipgloss.Top, topRow, browseFlavorTabs, browseTabs, browse) + "\n"
 }
 
 // renderFlavorTabs renders a 2-line tab strip (Retail | Classic) above the
@@ -273,6 +327,71 @@ func (m model) renderFlavorTabs(w int) string {
 	return lipgloss.JoinHorizontal(lipgloss.Bottom, retailTab, classicTab)
 }
 
+// renderBrowseFlavorTabs renders the Retail / Classic tab strip above the browse
+// panel, mirroring the installed flavor tabs.
+func (m model) renderBrowseFlavorTabs(w int) string {
+	focused := m.dashboardFocus == "browse"
+	accentCol := lipgloss.Color(m.theme.Accent)
+	if !focused {
+		accentCol = lipgloss.Color(m.theme.Border)
+	}
+	activeSty := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(accentCol).
+		Border(lipgloss.RoundedBorder(), true, true, false, true).
+		BorderForeground(accentCol).
+		Padding(0, 1)
+	inactiveSty := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(m.theme.Muted)).
+		Padding(0, 2)
+
+	var retailSty, classicSty lipgloss.Style
+	if m.browseFlavor == "retail" {
+		retailSty = activeSty
+		classicSty = inactiveSty
+	} else {
+		retailSty = inactiveSty
+		classicSty = activeSty
+	}
+
+	retailTab := zone.Mark("browse-flavor-tab-retail", retailSty.Render("Retail"))
+	classicTab := zone.Mark("browse-flavor-tab-classic", classicSty.Render("Classic"))
+	return lipgloss.JoinHorizontal(lipgloss.Bottom, retailTab, classicTab)
+}
+
+// renderBrowseTabs renders the All / Hot / New tab strip above the browse panel,
+// mirroring the style of renderFlavorTabs.
+func (m model) renderBrowseTabs(w int) string {
+	focused := m.dashboardFocus == "browse"
+	accentCol := lipgloss.Color(m.theme.Accent)
+	if !focused {
+		accentCol = lipgloss.Color(m.theme.Border)
+	}
+	activeSty := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(accentCol).
+		Border(lipgloss.RoundedBorder(), true, true, false, true).
+		BorderForeground(accentCol).
+		Padding(0, 1)
+	inactiveSty := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(m.theme.Muted)).
+		Padding(0, 2)
+
+	type tabDef struct{ id, label string }
+	defs := []tabDef{{"all", "All"}, {"hot", "Hot"}, {"new", "New"}}
+	var tabs []string
+	for _, td := range defs {
+		var rendered string
+		if m.browseTab == td.id {
+			rendered = zone.Mark("browse-tab-"+td.id, activeSty.Render(td.label))
+		} else {
+			rendered = zone.Mark("browse-tab-"+td.id, inactiveSty.Render(td.label))
+		}
+		tabs = append(tabs, rendered)
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Bottom, tabs...)
+}
+
 func (m model) renderInstalledPanel(outerW, outerH int) string {
 	s := m.getStyles()
 	innerW := outerW - 2
@@ -291,11 +410,12 @@ func (m model) renderInstalledPanel(outerW, outerH int) string {
 
 	count := len(m.config.Addons)
 
-	// Column widths: Name | Creator | Version | Status
-	// Fixed: cursor(1) + sep(2) + sep(2) + cCreator + sep(2) + cVer + sep(2) + status(1) = 10+cCreator+cVer
+	// Column widths: Name | Creator | Version | Source | Status
+	// Fixed: cursor(1) + 5×sep(2) + cCreator + cVer + cSource + status(1) = 12+cCreator+cVer+cSource
 	const cVer = 10
 	const cCreator = 14
-	cNm := innerW - 10 - cCreator - cVer
+	const cSource = 6
+	cNm := innerW - 12 - cCreator - cVer - cSource
 	if cNm > 26 {
 		cNm = 26
 	}
@@ -317,6 +437,7 @@ func (m model) renderInstalledPanel(outerW, outerH int) string {
 		" "+lipgloss.NewStyle().Width(cNm).Render("Name")+
 			"  "+lipgloss.NewStyle().Width(cCreator).Render("Creator")+
 			"  "+lipgloss.NewStyle().Width(cVer).Render("Version")+
+			"  "+lipgloss.NewStyle().Width(cSource).Render("Source")+
 			"  Status"))
 
 	headerLines := len(lines)
@@ -374,27 +495,33 @@ func (m model) renderInstalledPanel(outerW, outerH int) string {
 				stsGlyph, stsColor = "?", m.theme.Muted
 			}
 			stsStyled := lipgloss.NewStyle().Foreground(lipgloss.Color(stsColor)).Render(stsGlyph)
+			src := addonSource(aws.Addon)
 
-			// Selected row: name+creator+ver highlighted, status keeps its own color
+			// Selected row: name+creator+ver+source highlighted, status keeps its own color
 			var line string
 			if listPos == m.addonListCursor {
 				line = s.SelectedItem.Render(
 					">"+lipgloss.NewStyle().Width(cNm).Render(name)+
 						"  "+lipgloss.NewStyle().Width(cCreator).Render(cre)+
-						"  "+lipgloss.NewStyle().Width(cVer).Render(ver)) +
+						"  "+lipgloss.NewStyle().Width(cVer).Render(ver)+
+						"  "+lipgloss.NewStyle().Width(cSource).Render(src)) +
 					"  " + stsStyled
 			} else {
 				line = " " +
 					lipgloss.NewStyle().Width(cNm).Render(name) +
 					"  " + s.Muted.Width(cCreator).Render(cre) +
 					"  " + s.Value.Width(cVer).Render(ver) +
+					"  " + s.Muted.Width(cSource).Render(src) +
 					"  " + stsStyled
 			}
 			lines = append(lines, zone.Mark(fmt.Sprintf("inst-row-%d", listPos), line))
 		}
 	}
 
-	// Pad / clip to innerH
+	// Clamp every line to innerW then pad/clip to innerH.
+	for i, l := range lines {
+		lines[i] = ansi.Truncate(l, innerW, "")
+	}
 	for len(lines) < innerH {
 		lines = append(lines, "")
 	}
@@ -406,7 +533,8 @@ func (m model) renderInstalledPanel(outerW, outerH int) string {
 	return lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color(borderColor)).
-		Width(innerW).
+		Width(outerW).
+		MaxWidth(outerW).
 		Height(innerH).
 		Render(content)
 }
@@ -430,10 +558,6 @@ func (m model) renderBrowsePanel(outerW, outerH int) string {
 	count := len(m.addonDB)
 
 	var lines []string
-	// Title line
-	titleText := fmt.Sprintf(" Browse (%s) ", formatCount(count))
-	lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(m.theme.Secondary)).Render(titleText))
-
 	// Filter line
 	if m.browseDBFilterActive {
 		lines = append(lines, " Filter: "+m.textInputBrowseFilter.View())
@@ -455,12 +579,23 @@ func (m model) renderBrowsePanel(outerW, outerH int) string {
 	if count == 0 {
 		lines = append(lines, s.Muted.Render(" No database loaded."))
 	} else if len(m.browseDBIndices) == 0 {
-		lines = append(lines, s.Muted.Render(" No addons match filter."))
+		var emptyMsg string
+		switch {
+		case m.browseTab == "hot" && !m.rssHotLoaded:
+			emptyMsg = fmt.Sprintf(" %s Fetching hot list…", m.spinner.View())
+		case m.browseTab == "new" && !m.rssNewLoaded:
+			emptyMsg = fmt.Sprintf(" %s Fetching new releases…", m.spinner.View())
+		default:
+			emptyMsg = " No addons match filter."
+		}
+		lines = append(lines, s.Muted.Render(emptyMsg))
 	} else {
-		// Column widths: " " + cb(3) + "  " + name(nameW) + "  " + creator(creatorW) + "  " + desc(descW)
-		// fixed overhead = 1 + 3 + 2 + 2 + 2 = 10
+		// Column widths:
+		// " "(1) + cb(3) + "  " + name(nameW) + "  " + creator(14) + "  " + version(10) + "  " + desc(descW)
+		// fixed overhead = 1+3+2+2+14+2+10+2 = 36
 		const bCreatorW = 14
-		available := innerW - 10 - bCreatorW - 2
+		const bVersionW = 10
+		available := innerW - 36
 		if available < 10 {
 			available = 10
 		}
@@ -480,6 +615,7 @@ func (m model) renderBrowsePanel(outerW, outerH int) string {
 		hdr := s.Muted.Render(
 			"    " + lipgloss.NewStyle().Width(nameW).Render("Name") +
 				"  " + lipgloss.NewStyle().Width(bCreatorW).Render("Creator") +
+				"  " + lipgloss.NewStyle().Width(bVersionW).Render("Latest") +
 				"  " + "Description")
 		lines = append(lines, hdr)
 		listH--
@@ -509,24 +645,23 @@ func (m model) renderBrowsePanel(outerW, outerH int) string {
 				checkbox = "[✓]"
 			}
 
-			// Split "Creator/RepoName" into separate columns.
-			addonName := e.Repo
-			creator := ""
-			if parts := strings.SplitN(e.Repo, "/", 2); len(parts) == 2 {
-				creator = parts[0]
-				addonName = parts[1]
+			name := truncateStr(e.Name, nameW)
+			cre := truncateStr(e.Author, bCreatorW)
+			ver := displayVersion(e.LatestVersion)
+			if ver == "" {
+				ver = "—"
 			}
-			name := truncateStr(addonName, nameW)
-			cre := truncateStr(creator, bCreatorW)
+			ver = truncateStr(ver, bVersionW)
 			desc := truncateStr(e.Description, descW)
 
 			var line string
 			if listPos == m.browseDBCursor {
-				row := ">" + lipgloss.NewStyle().Width(3).Render(checkbox) +
-					"  " + lipgloss.NewStyle().Width(nameW).Render(name) +
-					"  " + lipgloss.NewStyle().Width(bCreatorW).Render(cre)
+				row := ">" + lipgloss.NewStyle().Width(3).MaxWidth(3).Render(checkbox) +
+					"  " + lipgloss.NewStyle().Width(nameW).MaxWidth(nameW).Render(name) +
+					"  " + lipgloss.NewStyle().Width(bCreatorW).MaxWidth(bCreatorW).Render(cre) +
+					"  " + lipgloss.NewStyle().Width(bVersionW).MaxWidth(bVersionW).Render(ver)
 				if descW > 0 {
-					row += "  " + lipgloss.NewStyle().Width(descW).Render(desc)
+					row += "  " + lipgloss.NewStyle().Width(descW).MaxWidth(descW).Render(desc)
 				}
 				line = s.SelectedItem.Render(row)
 			} else {
@@ -534,18 +669,22 @@ func (m model) renderBrowsePanel(outerW, outerH int) string {
 				if isSelected {
 					cbStyle = s.Success
 				}
-				line = " " + cbStyle.Width(3).Render(checkbox) +
-					"  " + s.Value.Width(nameW).Render(name) +
-					"  " + s.Muted.Width(bCreatorW).Render(cre)
+				line = " " + cbStyle.Width(3).MaxWidth(3).Render(checkbox) +
+					"  " + s.Value.Width(nameW).MaxWidth(nameW).Render(name) +
+					"  " + s.Muted.Width(bCreatorW).MaxWidth(bCreatorW).Render(cre) +
+					"  " + s.Info.Width(bVersionW).MaxWidth(bVersionW).Render(ver)
 				if descW > 0 {
-					line += "  " + s.Muted.Width(descW).Render(desc)
+					line += "  " + s.Muted.Width(descW).MaxWidth(descW).Render(desc)
 				}
 			}
-			lines = append(lines, zone.Mark(fmt.Sprintf("browse-row-%d", listPos), line))
+			lines = append(lines, zone.Mark(fmt.Sprintf("browse-row-%d", listPos), ansi.Truncate(line, innerW, "")))
 		}
 	}
 
-	// Pad / clip to innerH
+	// Clamp every line then pad/clip to innerH.
+	for i, l := range lines {
+		lines[i] = ansi.Truncate(l, innerW, "")
+	}
 	for len(lines) < innerH {
 		lines = append(lines, "")
 	}
@@ -557,7 +696,8 @@ func (m model) renderBrowsePanel(outerW, outerH int) string {
 	return lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color(borderColor)).
-		Width(innerW).
+		Width(outerW).
+		MaxWidth(outerW).
 		Height(innerH).
 		Render(content)
 }
@@ -596,6 +736,9 @@ func (m model) renderSidebar(outerW, outerH int) string {
 	} else if installed > 0 {
 		lines = append(lines, s.StatusOK.Render(" all up to date"))
 	}
+	if m.dbRefreshing {
+		lines = append(lines, s.Muted.Render(fmt.Sprintf(" %s refreshing DB…", m.spinner.View())))
+	}
 	lines = append(lines, div)
 
 	// Action buttons
@@ -615,7 +758,10 @@ func (m model) renderSidebar(outerW, outerH int) string {
 		lines = append(lines, zone.Mark(fmt.Sprintf("sidebar-action-%d", i), s.MenuItem.Render(label)))
 	}
 
-	// Pad / clip to innerH
+	// Clamp every line then pad/clip to innerH.
+	for i, l := range lines {
+		lines[i] = ansi.Truncate(l, innerW, "")
+	}
 	for len(lines) < innerH {
 		lines = append(lines, "")
 	}
@@ -627,7 +773,9 @@ func (m model) renderSidebar(outerW, outerH int) string {
 	return lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color(m.theme.Border)).
-		Width(innerW).
+		Width(outerW).
+		MaxWidth(outerW).
+		Height(innerH).
 		Render(content)
 }
 
@@ -665,13 +813,13 @@ func (m model) renderAddonList() string {
 	}
 
 	// Column widths — name column fills available terminal space.
-	const cSt, cIn, cLt, cFl = 3, 12, 12, 7
-	// 2 (indent) + cSt + 4×2 (separators) + cIn + cLt + cFl = 2+3+8+12+12+7 = 44
+	const cSt, cIn, cLt, cFl, cSrc = 3, 12, 12, 7, 5
+	// 2 (indent) + cSt + 5×2 (separators) + cIn + cLt + cFl + cSrc = 2+3+10+12+12+7+5 = 51
 	w := m.terminalWidth
 	if w <= 0 {
 		w = 80
 	}
-	cNm := w - 44
+	cNm := w - 51
 	if cNm < 16 {
 		cNm = 16
 	}
@@ -686,10 +834,11 @@ func (m model) renderAddonList() string {
 		hdr.Width(cNm).Render("Name") + "  " +
 		hdr.Width(cIn).Render("Installed") + "  " +
 		hdr.Width(cLt).Render("Latest") + "  " +
-		hdr.Width(cFl).Render("Flavor")
+		hdr.Width(cFl).Render("Flavor") + "  " +
+		hdr.Width(cSrc).Render("Src")
 	sb.WriteString(colHdr + "\n")
 	divLine := lipgloss.NewStyle().Foreground(lipgloss.Color(m.theme.Border)).
-		Render("  " + strings.Repeat("─", cSt+cNm+cIn+cLt+cFl+8))
+		Render("  " + strings.Repeat("─", cSt+cNm+cIn+cLt+cFl+cSrc+10))
 	sb.WriteString(divLine + "\n")
 
 	for listPos, addonIdx := range m.addonFilteredIndices {
@@ -713,6 +862,7 @@ func (m model) renderAddonList() string {
 		}
 
 		name := truncateStr(aws.Addon.Name, cNm)
+		src := addonSource(aws.Addon)
 
 		var lineStr string
 		if listPos == m.addonListCursor {
@@ -722,14 +872,16 @@ func (m model) renderAddonList() string {
 					lipgloss.NewStyle().Width(cNm).Render(name) + "  " +
 					lipgloss.NewStyle().Width(cIn).Render(installed) + "  " +
 					lipgloss.NewStyle().Width(cLt).Render(latest) + "  " +
-					lipgloss.NewStyle().Width(cFl).Render(aws.Addon.GameFlavor),
+					lipgloss.NewStyle().Width(cFl).Render(aws.Addon.GameFlavor) + "  " +
+					lipgloss.NewStyle().Width(cSrc).Render(src),
 			)
 		} else {
 			nameCell := lipgloss.NewStyle().Width(cNm).Render(name)
 			installedCell := s.Value.Width(cIn).Render(installed)
 			latestCell := s.StatusWarn.Width(cLt).Render(latest)
 			flavorCell := s.Muted.Width(cFl).Render(aws.Addon.GameFlavor)
-			lineStr = "  " + symCell + "  " + nameCell + "  " + installedCell + "  " + latestCell + "  " + flavorCell
+			srcCell := s.Muted.Width(cSrc).Render(src)
+			lineStr = "  " + symCell + "  " + nameCell + "  " + installedCell + "  " + latestCell + "  " + flavorCell + "  " + srcCell
 		}
 		sb.WriteString(zone.Mark(fmt.Sprintf("addon-%d", listPos), lineStr) + "\n")
 	}
@@ -741,8 +893,6 @@ func (m model) renderAddonList() string {
 
 func (m model) renderAddonDetail() string {
 	s := m.getStyles()
-	var sb strings.Builder
-
 	if m.selectedAddonIdx >= len(m.config.Addons) {
 		return s.Error.Render("  Invalid selection") + "\n"
 	}
@@ -755,115 +905,19 @@ func (m model) renderAddonDetail() string {
 		aws = AddonWithStatus{Addon: addon, Status: StatusUnknown}
 	}
 
-	sb.WriteString(s.Highlight.Render("  "+addon.Name) + "  " + s.Muted.Render(addon.GithubRepo) + "\n\n")
+	var sb strings.Builder
+	sb.WriteString(s.Highlight.Render("  "+addon.Name) + "\n\n")
 
-	labelStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(m.theme.Secondary))
-	valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(m.theme.Highlight))
-	mutedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(m.theme.Muted))
-
-	tableWidth := m.terminalWidth - 8
-	if tableWidth < 40 {
-		tableWidth = 40
-	}
-
-	// Build rows
-	type row struct{ label, value string }
-	rows := []row{
-		{"Repository", addon.GithubRepo},
-		{"Flavor", addon.GameFlavor},
-	}
-	if addon.InstalledVersion != "" {
-		iv := displayVersion(addon.InstalledVersion)
-		if addon.InstalledDate != "" {
-			iv += "  ·  " + formatDate(addon.InstalledDate)
-		}
-		rows = append(rows, row{"Installed", iv})
-	} else {
-		rows = append(rows, row{"Installed", "not installed"})
-	}
-	// Use runtime value when available; fall back to persisted value after restart.
-	detailLatestVer := aws.LatestVersion
-	if detailLatestVer == "" {
-		detailLatestVer = addon.LatestVersion
-	}
-	detailLatestDate := aws.LatestDate
-	if detailLatestDate == "" {
-		detailLatestDate = addon.LatestDate
-	}
-	if detailLatestVer != "" {
-		lv := displayVersion(detailLatestVer)
-		if detailLatestDate != "" {
-			lv += "  ·  " + formatDate(detailLatestDate)
-		}
-		rows = append(rows, row{"Latest", lv})
-	}
-	if len(addon.Directories) > 0 {
-		rows = append(rows, row{"Folders", strings.Join(addon.Directories, ",  ")})
-	}
-	if len(addon.Profiles) > 0 {
-		rows = append(rows, row{"Profiles", strings.Join(addon.Profiles, ",  ")})
-	}
-
-	// Status row
-	switch aws.Status {
-	case StatusUpToDate:
-		rows = append(rows, row{"Status", "✓  Up to date"})
-	case StatusUpdateAvail:
-		rows = append(rows, row{"Status", fmt.Sprintf("!  Update: %s  →  %s", displayVersion(addon.InstalledVersion), displayVersion(detailLatestVer))})
-	case StatusNotInstalled:
-		rows = append(rows, row{"Status", "✗  Not installed"})
-	default:
-		rows = append(rows, row{"Status", "?  Unknown"})
-	}
-
-	// Render as lipgloss table
-	t := lgtable.New().
-		Border(lipgloss.RoundedBorder()).
-		BorderStyle(lipgloss.NewStyle().Foreground(lipgloss.Color(m.theme.Border))).
-		StyleFunc(func(row, col int) lipgloss.Style {
-			if col == 0 {
-				return labelStyle
-			}
-			return valueStyle
-		}).
-		Width(tableWidth)
-
-	for _, r := range rows {
-		t.Row(r.label, r.value)
-	}
-	for _, line := range strings.Split(t.Render(), "\n") {
-		sb.WriteString("  " + line + "\n")
-	}
-
-	// Changelog / release notes
-	if addon.Changelog != "" {
-		sb.WriteString("\n")
-		sb.WriteString("  " + labelStyle.Render("Changelog") + "\n")
-		lines := strings.Split(strings.TrimRight(addon.Changelog, "\n\r"), "\n")
-		// How many lines fit below: header(2) + name(2) + table(~12) + this header(2) + actions(2)
-		maxLines := m.terminalHeight - 20
-		if maxLines < 3 {
-			maxLines = 3
-		}
-		if maxLines > 12 {
-			maxLines = 12
-		}
-		shown := lines
-		truncated := false
-		if len(lines) > maxLines {
-			shown = lines[:maxLines]
-			truncated = true
-		}
-		for _, ln := range shown {
-			ln = truncateStr(strings.TrimRight(ln, "\r"), m.terminalWidth-6)
-			sb.WriteString("  " + mutedStyle.Render(ln) + "\n")
-		}
-		if truncated {
-			sb.WriteString("  " + mutedStyle.Render(fmt.Sprintf("… %d more lines", len(lines)-maxLines)) + "\n")
-		}
+	// Full detail content rendered via glamour in a scrollable viewport.
+	sb.WriteString(m.viewport.View())
+	if !m.viewport.AtTop() || !m.viewport.AtBottom() {
+		pct := m.viewport.ScrollPercent()
+		mutedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(m.theme.Muted))
+		sb.WriteString("\n  " + mutedStyle.Render(fmt.Sprintf("%.0f%%  ↑/↓ to scroll", pct*100)) + "\n")
 	}
 
 	sb.WriteString("\n")
+	mutedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(m.theme.Muted))
 	var actionParts []string
 	if aws.Status != StatusUpToDate {
 		actionParts = append(actionParts, zone.Mark("detail-update", s.StatusWarn.Render("[u] Update")))
@@ -873,6 +927,33 @@ func (m model) renderAddonDetail() string {
 		mutedStyle.Render("esc back"),
 	)
 	sb.WriteString("  " + strings.Join(actionParts, mutedStyle.Render("  ·  ")) + "\n")
+	return sb.String()
+}
+
+// ── Browse addon detail ───────────────────────────────────────────────────────
+
+func (m model) renderBrowseDetail() string {
+	s := m.getStyles()
+	if m.selectedBrowseDBIdx >= len(m.addonDB) {
+		return s.Error.Render("  Invalid selection") + "\n"
+	}
+	e := m.addonDB[m.selectedBrowseDBIdx]
+
+	var sb strings.Builder
+	sb.WriteString(s.Highlight.Render("  "+e.Name) + "\n\n")
+
+	// Scrollable rendered markdown body.
+	sb.WriteString(m.viewport.View())
+	if !m.viewport.AtTop() || !m.viewport.AtBottom() {
+		pct := m.viewport.ScrollPercent()
+		mutedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(m.theme.Muted))
+		sb.WriteString("\n  " + mutedStyle.Render(fmt.Sprintf("%.0f%%  ↑/↓ to scroll", pct*100)) + "\n")
+	}
+
+	sb.WriteString("\n")
+	mutedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(m.theme.Muted))
+	installBtn := zone.Mark("browse-detail-install", s.Success.Render("[i] Install"))
+	sb.WriteString("  " + installBtn + mutedStyle.Render("  ·  esc back") + "\n")
 	return sb.String()
 }
 
@@ -889,13 +970,13 @@ func (m model) renderAddRepoInput() string {
 	if len(m.dbSuggestions) > 0 {
 		sb.WriteString(s.Muted.Render("  Suggestions — Tab to cycle, click to select:") + "\n")
 
-		const cRp, cSt, cLn = 42, 8, 12
+		const cNm, cAu = 28, 16
 		for i, e := range m.dbSuggestions {
-			stars := "★ " + formatStars(e.Stars)
-			lang := e.Language
-			if lang == "" {
-				lang = "?"
+			name := e.Name
+			if name == "" {
+				name = e.Repo
 			}
+			author := e.Author
 			desc := e.Description
 			if len(desc) > 45 {
 				desc = desc[:42] + "..."
@@ -905,17 +986,15 @@ func (m model) renderAddRepoInput() string {
 			if i == m.dbSuggestionIdx {
 				lineStr = s.SelectedItem.Render(
 					"> " +
-						lipgloss.NewStyle().Width(cRp).MaxWidth(cRp).Render(e.Repo) + "  " +
-						lipgloss.NewStyle().Width(cSt).MaxWidth(cSt).Render(stars) + "  " +
-						lipgloss.NewStyle().Width(cLn).MaxWidth(cLn).Render(lang) + "  " +
+						lipgloss.NewStyle().Width(cNm).MaxWidth(cNm).Render(name) + "  " +
+						lipgloss.NewStyle().Width(cAu).MaxWidth(cAu).Render(author) + "  " +
 						desc,
 				)
 			} else {
 				lineStr = s.Muted.Render(
 					"  " +
-						lipgloss.NewStyle().Width(cRp).MaxWidth(cRp).Render(e.Repo) + "  " +
-						lipgloss.NewStyle().Width(cSt).MaxWidth(cSt).Render(stars) + "  " +
-						lipgloss.NewStyle().Width(cLn).MaxWidth(cLn).Render(lang) + "  " +
+						lipgloss.NewStyle().Width(cNm).MaxWidth(cNm).Render(name) + "  " +
+						lipgloss.NewStyle().Width(cAu).MaxWidth(cAu).Render(author) + "  " +
 						desc,
 				)
 			}
@@ -976,6 +1055,26 @@ func (m model) renderAddRepoConfirm() string {
 				break
 			}
 			content.WriteString(s.Muted.Render("  "+line) + "\n")
+		}
+	}
+
+	// Description from the addon DB (WoWI or GitHub entries).
+	if entry := m.pendingDBEntry(); entry != nil && entry.Description != "" {
+		content.WriteString("\n" + s.Label.Render("Description:") + "\n")
+		desc := entry.Description
+		if m.glamourRenderer != nil {
+			if out, err := m.glamourRenderer.Render(desc); err == nil {
+				desc = out
+			}
+		}
+		lines := strings.Split(strings.TrimSpace(desc), "\n")
+		const maxDescLines = 10
+		for i, line := range lines {
+			if i >= maxDescLines {
+				content.WriteString(s.Muted.Render("  ...") + "\n")
+				break
+			}
+			content.WriteString(line + "\n")
 		}
 	}
 
@@ -1072,6 +1171,33 @@ func (m model) renderUpdatingAll() string {
 }
 
 // ── Delete confirm ────────────────────────────────────────────────────────────
+
+func (m model) renderQuitConfirm() string {
+	s := m.getStyles()
+
+	noStyle := s.Muted
+	yesStyle := s.Muted
+	if m.quitConfirmFocus == "yes" {
+		yesStyle = s.SelectedItem
+	} else {
+		noStyle = s.SelectedItem
+	}
+
+	yesBtn := zone.Mark("quit-yes", yesStyle.Render("[ Yes ]"))
+	noBtn := zone.Mark("quit-no", noStyle.Render("[ No ]"))
+
+	var content strings.Builder
+	content.WriteString(s.Warning.Render("Quit WoW Addon Tracker?") + "\n\n")
+	content.WriteString(yesBtn + "    " + noBtn + "\n")
+	content.WriteString("\n" + s.Muted.Render("←/→ toggle · enter confirm · esc cancel"))
+
+	boxStyle := lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(m.theme.Accent)).
+		Padding(1, 3)
+
+	return boxStyle.Render(content.String()) + "\n"
+}
 
 func (m model) renderConfirmDelete() string {
 	s := m.getStyles()
@@ -1396,12 +1522,16 @@ func (m model) renderBrowseDB() string {
 			checkbox = "[✓]"
 		}
 
+		displayName := e.Name
+		if displayName == "" {
+			displayName = e.Repo
+		}
 		var lineStr string
 		if listPos == m.browseDBCursor {
 			line := "> " + lipgloss.NewStyle().Width(3).MaxWidth(3).Render(checkbox) + "  " +
-				lipgloss.NewStyle().Width(repoW).MaxWidth(repoW).Render(truncateStr(e.Repo, repoW))
+				lipgloss.NewStyle().Width(repoW).MaxWidth(repoW).Render(truncateStr(displayName, repoW))
 			if descW > 0 {
-				line += "  " + lipgloss.NewStyle().Width(descW).Render(truncateStr(e.Description, descW))
+				line += "  " + lipgloss.NewStyle().Width(descW).MaxWidth(descW).Render(truncateStr(e.Description, descW))
 			}
 			lineStr = s.SelectedItem.Render(line)
 		} else {
@@ -1410,12 +1540,12 @@ func (m model) renderBrowseDB() string {
 				cbStyle = s.Success
 			}
 			lineStr = "  " + cbStyle.Width(3).MaxWidth(3).Render(checkbox) + "  " +
-				s.Value.Width(repoW).MaxWidth(repoW).Render(truncateStr(e.Repo, repoW))
+				s.Value.Width(repoW).MaxWidth(repoW).Render(truncateStr(displayName, repoW))
 			if descW > 0 {
-				lineStr += "  " + s.Muted.Width(descW).Render(truncateStr(e.Description, descW))
+				lineStr += "  " + s.Muted.Width(descW).MaxWidth(descW).Render(truncateStr(e.Description, descW))
 			}
 		}
-		sb.WriteString(zone.Mark(fmt.Sprintf("browse-row-%d", visualRow), lineStr) + "\n")
+		sb.WriteString(zone.Mark(fmt.Sprintf("browse-row-%d", visualRow), ansi.Truncate(lineStr, w, "")) + "\n")
 	}
 	sb.WriteString(divLine + "\n")
 	return sb.String()
@@ -1437,7 +1567,11 @@ func (m model) renderBrowseInstallConfirm() string {
 			sb.WriteString(s.Muted.Render(fmt.Sprintf("    ... and %d more", remaining)) + "\n")
 			break
 		}
-		sb.WriteString(fmt.Sprintf("  %s  %s\n", s.Success.Render("•"), s.Value.Render(m.addonDB[idx].Repo)))
+		name := m.addonDB[idx].Name
+		if name == "" {
+			name = m.addonDB[idx].Repo
+		}
+		sb.WriteString(fmt.Sprintf("  %s  %s\n", s.Success.Render("•"), s.Value.Render(name)))
 		shown++
 	}
 
@@ -1460,6 +1594,14 @@ func (m model) renderBrowseInstallConfirm() string {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+// addonSource returns the short source label for a tracked addon.
+func addonSource(addon TrackedAddon) string {
+	if strings.HasPrefix(addon.GithubRepo, "wowinterface:") {
+		return "WoW:I"
+	}
+	return "GH"
+}
 
 // statusGlyph returns the status symbol and its theme color hex.
 func statusGlyph(status UpdateStatus, t Theme) (string, string) {

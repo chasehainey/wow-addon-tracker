@@ -26,6 +26,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.SetWidth(msg.Width)
 			m.viewport.SetHeight(msg.Height - 6)
 		}
+		m.glamourRenderer = newGlamourRenderer(msg.Width - 8)
+		if m.viewAddonDetail {
+			m = setupChangelogViewport(m)
+		}
+		if m.viewBrowseDetail {
+			m = setupBrowseDetailViewport(m)
+		}
 		return m, cmd
 	}
 
@@ -36,8 +43,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// 3. Spinner tick (always keep spinner alive while loading)
-	if m.loading {
+	// 3. Spinner tick — keep alive while loading or RSS feeds are in-flight.
+	rssInFlight := !m.rssHotLoaded || !m.rssNewLoaded
+	if m.loading || m.dbRefreshing || rssInFlight {
 		var spinnerCmd tea.Cmd
 		m.spinner, spinnerCmd = m.spinner.Update(msg)
 		if _, ok := msg.(spinner.TickMsg); ok {
@@ -64,7 +72,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.config.Addons) > 0 {
 			m.checkingUpdates = true
 			m.loading = true
-			return m, tea.Batch(cmd, checkAllAddons(m.config.Addons, m.config.GithubToken), autoCheckTick())
+			return m, tea.Batch(cmd, checkAllAddons(m.config.Addons, m.addonDB, m.config.GithubToken), autoCheckTick())
 		}
 		return m, tea.Batch(cmd, autoCheckTick())
 
@@ -152,7 +160,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
-		// Triggered from add-addon flow
+		// Triggered from add-addon / browse-click flow.
+		// Update the GitHub DB entry with fresh release data (WoWI entries
+		// are already populated from the embedded DB).
+		if msg.release.TagName != "" && msg.release.TagName != "HEAD" {
+			for i, e := range m.addonDB {
+				if e.Repo != "" && e.Repo == msg.repo {
+					m.addonDB[i].LatestVersion = msg.release.TagName
+					m.addonDB[i].LatestDate = releaseDate(msg.release)
+					if msg.release.Body != "" {
+						m.addonDB[i].Changelog = msg.release.Body
+					}
+					break
+				}
+			}
+		}
 		release := msg.release
 		m.pendingRelease = &release
 		m.pendingRepo = msg.repo
@@ -248,7 +270,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if !found {
 			name := msg.repo
-			if parts := strings.SplitN(msg.repo, "/", 2); len(parts) == 2 {
+			if id := wowiIDFromKey(msg.repo); id > 0 {
+				// WoWInterface addon — look up display name from the DB.
+				for _, e := range m.addonDB {
+					if e.WoWInterfaceID == id {
+						name = e.Name
+						break
+					}
+				}
+			} else if parts := strings.SplitN(msg.repo, "/", 2); len(parts) == 2 {
 				name = parts[1]
 			}
 			// When the addon ships without a folder and we extract into a named
@@ -263,6 +293,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			newAddon := TrackedAddon{
 				Name:             name,
 				GithubRepo:       msg.repo,
+				WoWInterfaceID:   wowiIDFromKey(msg.repo),
 				InstalledVersion: msg.version,
 				InstalledDate:    installedAt,
 				Changelog:        msg.changelog,
@@ -285,7 +316,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.browseInstallIdx < len(m.browseInstallQueue) {
 				m.loading = true
 				m.installing = true
-				return m, tea.Batch(saveConfig(m.config), fetchLatestRelease(m.browseInstallQueue[m.browseInstallIdx], m.config.GithubToken))
+				return m, tea.Batch(saveConfig(m.config), m.nextBrowseInstallCmd())
 			}
 			m.browseInstalling = false
 			count := len(m.browseInstallQueue)
@@ -332,7 +363,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.config.Addons) > 0 && !m.checkingUpdates && !m.installing && !m.updatingAll {
 			m.checkingUpdates = true
 			m.loading = true
-			return m, tea.Batch(next, checkAllAddons(m.config.Addons, m.config.GithubToken))
+			return m, tea.Batch(next, checkAllAddons(m.config.Addons, m.addonDB, m.config.GithubToken))
 		}
 		return m, next
 
@@ -360,19 +391,63 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmd, saveConfig(m.config))
 
 	case dbLoadedMsg:
-		if msg.err == nil {
-			m.addonDB = msg.entries
-			m.browseDBIndices = allDBIndices(m.addonDB)
-			if msg.save {
-				// Persist remote fetch to local cache and confirm to the user.
-				m.successMsg = fmt.Sprintf("Addon DB updated (%d addons)", len(m.addonDB))
-				return m, saveAddonDB(m.addonDB)
+		m.dbRefreshing = false
+		if msg.err != nil {
+			if len(m.addonDB) == 0 {
+				m.errorMsg = "DB load error: " + msg.err.Error()
+			} else {
+				m.errorMsg = "DB refresh failed: " + msg.err.Error()
 			}
-		} else if msg.save {
-			// Remote fetch failed — keep whatever we already have loaded.
-			m.errorMsg = "DB refresh failed: " + msg.err.Error()
+			return m, cmd
 		}
-		m.browseDBIndices = allDBIndices(m.addonDB)
+		m.addonDB = msg.entries
+		m.browseDBIndices = m.browseCurIndices()
+		// Update status for WoWInterface-installed addons from the loaded DB.
+		wowiIdx := make(map[int]AddonDBEntry, len(m.addonDB))
+		for _, e := range m.addonDB {
+			if e.WoWInterfaceID > 0 {
+				wowiIdx[e.WoWInterfaceID] = e
+			}
+		}
+		for i, aws := range m.addonsWithStatus {
+			id := wowiIDFromKey(aws.Addon.GithubRepo)
+			if id == 0 {
+				continue
+			}
+			e, ok := wowiIdx[id]
+			if !ok || e.LatestVersion == "" {
+				continue
+			}
+			m.addonsWithStatus[i].LatestVersion = e.LatestVersion
+			m.addonsWithStatus[i].LatestDate = e.LatestDate
+			if aws.Addon.InstalledVersion == "" {
+				m.addonsWithStatus[i].Status = StatusNotInstalled
+			} else if normalizeVersion(aws.Addon.InstalledVersion) == normalizeVersion(e.LatestVersion) {
+				m.addonsWithStatus[i].Status = StatusUpToDate
+			} else {
+				m.addonsWithStatus[i].Status = StatusUpdateAvail
+			}
+		}
+		return m, cmd
+
+	case rssLoadedMsg:
+		if msg.feedType == "hot" {
+			m.rssHotLoaded = true
+			if msg.err == nil {
+				m.hotIDs = msg.ids
+			}
+		} else {
+			m.rssNewLoaded = true
+			if msg.err == nil {
+				m.latestIDs = msg.ids
+			}
+		}
+		// Recompute browse indices if we're on the affected tab.
+		if (msg.feedType == "hot" && m.browseTab == "hot") ||
+			(msg.feedType == "new" && m.browseTab == "new") {
+			m.browseDBIndices = m.browseCurIndices()
+			m.browseDBCursor = 0
+		}
 		return m, cmd
 
 	case progress.FrameMsg:
@@ -392,6 +467,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	// 5. Mode if-chain (most specific first)
+	if m.viewBrowseDetail {
+		return m.handleBrowseDetail(msg)
+	}
+
 	if m.browseInstallConfirm {
 		if keyMsg, ok := msg.(tea.KeyPressMsg); ok {
 			return m.handleBrowseInstallConfirm(keyMsg)
@@ -421,7 +500,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if keyMsg, ok := msg.(tea.KeyPressMsg); ok {
 			return m.handleAddonDetail(keyMsg)
 		}
-		return m, cmd
+		var vpCmd tea.Cmd
+		m.viewport, vpCmd = m.viewport.Update(msg)
+		return m, tea.Batch(cmd, vpCmd)
 	}
 
 	if m.inputNewProfile {
@@ -468,6 +549,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	if m.confirmQuit {
+		if keyMsg, ok := msg.(tea.KeyPressMsg); ok {
+			return m.handleQuitConfirm(keyMsg)
+		}
+		return m, cmd
+	}
+
 	// Default: dashboard
 	if !m.loading {
 		return m.handleDashboard(msg)
@@ -490,11 +578,53 @@ func autoCheckTick() tea.Cmd {
 	})
 }
 
-// startNextQueuedUpdate dispatches a release fetch for the next item in the update queue
+// startNextQueuedUpdate dispatches the next update in the queue.
+// WoWInterface addons are installed directly from the DB without a GitHub fetch.
 func (m model) startNextQueuedUpdate() tea.Cmd {
 	if m.updateQueueIdx >= len(m.updateQueue) {
 		return nil
 	}
 	repo := m.updateQueue[m.updateQueueIdx]
+	if id := wowiIDFromKey(repo); id > 0 {
+		for _, e := range m.addonDB {
+			if e.WoWInterfaceID == id {
+				release := wowiMakeRelease(e)
+				flavor := "retail"
+				ea := e.ExtractAs
+				for _, a := range m.config.Addons {
+					if a.GithubRepo == repo {
+						flavor = a.GameFlavor
+						if a.ExtractAs != "" {
+							ea = a.ExtractAs
+						}
+						break
+					}
+				}
+				path := addonPath(m.config, flavor)
+				return tea.Batch(installAddon(repo, release, path, "", ea), downloadTick())
+			}
+		}
+		return nil
+	}
+	return fetchLatestRelease(repo, m.config.GithubToken)
+}
+
+// nextBrowseInstallCmd returns the install command for the current browse queue item.
+func (m model) nextBrowseInstallCmd() tea.Cmd {
+	if m.browseInstallIdx >= len(m.browseInstallQueue) {
+		return nil
+	}
+	repo := m.browseInstallQueue[m.browseInstallIdx]
+	if id := wowiIDFromKey(repo); id > 0 {
+		for _, e := range m.addonDB {
+			if e.WoWInterfaceID == id {
+				release := wowiMakeRelease(e)
+				path := addonPath(m.config, m.browseInstallFlavor)
+				ea := addonExtractAs(repo, m.config.Addons, m.addonDB)
+				return tea.Batch(installAddon(repo, release, path, "", ea), downloadTick())
+			}
+		}
+		return nil
+	}
 	return fetchLatestRelease(repo, m.config.GithubToken)
 }

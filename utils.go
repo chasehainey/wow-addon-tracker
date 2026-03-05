@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/glamour"
 )
 
 // getStyles returns lipgloss styles based on the current theme
@@ -109,6 +111,22 @@ func detectTerminalBackground() bool {
 	return true
 }
 
+// newGlamourRenderer creates a glamour TermRenderer sized to the given content
+// width using the auto dark/light style.  Falls back gracefully on error.
+func newGlamourRenderer(width int) *glamour.TermRenderer {
+	if width < 20 {
+		width = 80
+	}
+	r, err := glamour.NewTermRenderer(
+		glamour.WithAutoStyle(),
+		glamour.WithWordWrap(width),
+	)
+	if err != nil {
+		return nil
+	}
+	return r
+}
+
 func initialModel() model {
 	tiRepo := textinput.New()
 	tiRepo.Placeholder = "Owner/Repo (e.g. WeakAuras2/WeakAuras2)"
@@ -180,17 +198,36 @@ func initialModel() model {
 		spinner:         s,
 		progressBar:     pb,
 		theme:           selectedTheme,
+		glamourRenderer: newGlamourRenderer(80),
 		updateQueue:     []string{},
 		updateAllErrors: []string{},
 		dbSuggestionIdx:  -1,
-		browseDBIndices:  []int{},
-		browseDBSelected: make(map[int]struct{}),
+		browseFlavor:        "retail",
+		browseDBIndices:     []int{},
+		browseDBSelected:    make(map[int]struct{}),
 		browseInstallFlavor: "retail",
+		browseTab:           "all",
 	}
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(m.spinner.Tick, loadConfig(), loadAddonDB(), fetchRemoteDB())
+	return tea.Batch(m.spinner.Tick, loadConfig(), loadAddonDB(),
+		fetchWoWIRSS("hot"), fetchWoWIRSS("new"))
+}
+
+// browseCurIndices returns browse DB indices for the current tab and filter,
+// narrowed to the current browseFlavor (retail/classic).
+func (m model) browseCurIndices() []int {
+	var raw []int
+	switch m.browseTab {
+	case "hot":
+		raw = computeTabIndices(m.browseDBFilter, m.addonDB, m.hotIDs)
+	case "new":
+		raw = computeTabIndices(m.browseDBFilter, m.addonDB, m.latestIDs)
+	default:
+		raw = computeBrowseFilter(m.browseDBFilter, m.addonDB)
+	}
+	return filterByFlavor(raw, m.addonDB, m.browseFlavor)
 }
 
 // computeAddonFilter returns indices into addons that match the flavor and
@@ -275,6 +312,250 @@ func addonExtractAs(repo string, addons []TrackedAddon, db []AddonDBEntry) strin
 		}
 	}
 	return ""
+}
+
+// setupChangelogViewport renders the full installed addon detail into m.viewport.
+// Call this whenever viewAddonDetail becomes true or the terminal is resized.
+func setupChangelogViewport(m model) model {
+	var rendered string
+	if m.selectedAddonIdx < len(m.config.Addons) {
+		addon := m.config.Addons[m.selectedAddonIdx]
+		var aws AddonWithStatus
+		if m.selectedAddonIdx < len(m.addonsWithStatus) {
+			aws = m.addonsWithStatus[m.selectedAddonIdx]
+		} else {
+			aws = AddonWithStatus{Addon: addon, Status: StatusUnknown}
+		}
+		dbEntry := m.installedAddonDBEntry(addon)
+		md := buildInstalledAddonMarkdown(addon, aws, dbEntry)
+		if m.glamourRenderer != nil {
+			if out, err := m.glamourRenderer.Render(md); err == nil {
+				rendered = out
+			} else {
+				rendered = md
+			}
+		} else {
+			rendered = md
+		}
+	}
+	// Overhead: header(8) + name+blank(2) + scroll-indicator(2) + blank+action(2) + footer(2) = 16
+	h := m.terminalHeight - 16
+	if h < 5 {
+		h = 5
+	}
+	m.viewport.SetHeight(h)
+	m.viewport.SetWidth(m.terminalWidth - 4)
+	m.viewport.SetContent(rendered)
+	m.viewport.GotoTop()
+	return m
+}
+
+// buildBrowseDetailMarkdown constructs a Markdown document containing all
+// scraped information for an AddonDBEntry. Description comes first so it is
+// immediately visible without scrolling; metadata and changelog follow.
+func buildBrowseDetailMarkdown(e AddonDBEntry) string {
+	var sb strings.Builder
+
+	sb.WriteString("# " + e.Name + "\n\n")
+
+	// Compact single-line header: author · version · date
+	var headerParts []string
+	if e.Author != "" {
+		headerParts = append(headerParts, "by **"+e.Author+"**")
+	}
+	if e.LatestVersion != "" {
+		headerParts = append(headerParts, displayVersion(e.LatestVersion))
+	}
+	if e.LatestDate != "" {
+		headerParts = append(headerParts, formatDate(e.LatestDate))
+	}
+	if len(headerParts) > 0 {
+		sb.WriteString(strings.Join(headerParts, "  ·  ") + "\n\n")
+	}
+
+	// Description immediately after the title so it is visible on first open.
+	if e.Description != "" {
+		sb.WriteString(e.Description + "\n\n")
+	}
+
+	// Details section below the description.
+	sb.WriteString("---\n\n")
+
+	var dlParts []string
+	if e.Downloads > 0 {
+		dlParts = append(dlParts, "**Downloads:** "+formatInt(e.Downloads))
+	}
+	if e.DownloadsMonthly > 0 {
+		dlParts = append(dlParts, formatInt(e.DownloadsMonthly)+"/month")
+	}
+	if e.Favorites > 0 {
+		dlParts = append(dlParts, "★ "+formatInt(e.Favorites)+" favorites")
+	}
+	if len(dlParts) > 0 {
+		sb.WriteString(strings.Join(dlParts, "  ·  ") + "\n\n")
+	}
+
+	if len(e.Compatibility) > 0 {
+		sb.WriteString("**Compatible with:** " + strings.Join(e.Compatibility, " · ") + "\n\n")
+	}
+
+	if e.FileInfoURL != "" {
+		sb.WriteString("**Page:** [" + e.FileInfoURL + "](" + e.FileInfoURL + ")\n\n")
+	}
+
+	if e.Changelog != "" && e.Changelog != "None" {
+		sb.WriteString("---\n\n## Changelog\n\n")
+		sb.WriteString(e.Changelog + "\n\n")
+	}
+
+	return sb.String()
+}
+
+// formatInt formats an integer with thousands separators.
+func formatInt(n int) string {
+	s := fmt.Sprintf("%d", n)
+	if len(s) <= 3 {
+		return s
+	}
+	var out []byte
+	rem := len(s) % 3
+	if rem == 0 {
+		rem = 3
+	}
+	out = append(out, s[:rem]...)
+	for i := rem; i < len(s); i += 3 {
+		out = append(out, ',')
+		out = append(out, s[i:i+3]...)
+	}
+	return string(out)
+}
+
+// buildInstalledAddonMarkdown constructs a Markdown document for an installed addon,
+// combining live status with any description/changelog from the addon DB.
+func buildInstalledAddonMarkdown(addon TrackedAddon, aws AddonWithStatus, dbEntry *AddonDBEntry) string {
+	var sb strings.Builder
+
+	sb.WriteString("# " + addon.Name + "\n\n")
+
+	if dbEntry != nil && dbEntry.Author != "" {
+		sb.WriteString("**Author:** " + dbEntry.Author + "\n\n")
+	}
+
+	sb.WriteString("**Source:** " + addonSource(addon) + "\n\n")
+	sb.WriteString("**Flavor:** " + addon.GameFlavor + "\n\n")
+
+	var verParts []string
+	if addon.InstalledVersion != "" {
+		v := "**Installed:** " + displayVersion(addon.InstalledVersion)
+		if addon.InstalledDate != "" {
+			v += "  ·  " + formatDate(addon.InstalledDate)
+		}
+		verParts = append(verParts, v)
+	}
+	latestVer := aws.LatestVersion
+	if latestVer == "" {
+		latestVer = addon.LatestVersion
+	}
+	latestDate := aws.LatestDate
+	if latestDate == "" {
+		latestDate = addon.LatestDate
+	}
+	if latestVer != "" {
+		v := "**Latest:** " + displayVersion(latestVer)
+		if latestDate != "" {
+			v += "  ·  " + formatDate(latestDate)
+		}
+		verParts = append(verParts, v)
+	}
+	for _, p := range verParts {
+		sb.WriteString(p + "\n\n")
+	}
+
+	switch aws.Status {
+	case StatusUpToDate:
+		sb.WriteString("**Status:** ✓ Up to date\n\n")
+	case StatusUpdateAvail:
+		sb.WriteString(fmt.Sprintf("**Status:** ! Update available: %s → %s\n\n",
+			displayVersion(addon.InstalledVersion), displayVersion(latestVer)))
+	case StatusNotInstalled:
+		sb.WriteString("**Status:** ✗ Not installed\n\n")
+	}
+
+	if len(addon.Directories) > 0 {
+		sb.WriteString("**Folders:** " + strings.Join(addon.Directories, ", ") + "\n\n")
+	}
+	if len(addon.Profiles) > 0 {
+		sb.WriteString("**Profiles:** " + strings.Join(addon.Profiles, ", ") + "\n\n")
+	}
+
+	if dbEntry != nil {
+		var dlParts []string
+		if dbEntry.Downloads > 0 {
+			dlParts = append(dlParts, "**Downloads:** "+formatInt(dbEntry.Downloads))
+		}
+		if dbEntry.DownloadsMonthly > 0 {
+			dlParts = append(dlParts, formatInt(dbEntry.DownloadsMonthly)+"/month")
+		}
+		if dbEntry.Favorites > 0 {
+			dlParts = append(dlParts, "★ "+formatInt(dbEntry.Favorites)+" favorites")
+		}
+		if len(dlParts) > 0 {
+			sb.WriteString(strings.Join(dlParts, "  ·  ") + "\n\n")
+		}
+		if len(dbEntry.Compatibility) > 0 {
+			sb.WriteString("**Compatible with:** " + strings.Join(dbEntry.Compatibility, " · ") + "\n\n")
+		}
+		if dbEntry.FileInfoURL != "" {
+			sb.WriteString("**Page:** [" + dbEntry.FileInfoURL + "](" + dbEntry.FileInfoURL + ")\n\n")
+		}
+		if dbEntry.Description != "" {
+			sb.WriteString("---\n\n## Description\n\n")
+			sb.WriteString(dbEntry.Description + "\n\n")
+		}
+	}
+
+	changelog := addon.Changelog
+	if changelog == "" && dbEntry != nil {
+		changelog = dbEntry.Changelog
+	}
+	if changelog != "" && changelog != "None" {
+		sb.WriteString("---\n\n## Changelog\n\n")
+		sb.WriteString(changelog + "\n\n")
+	}
+
+	return sb.String()
+}
+
+// setupBrowseDetailViewport renders the selected browse addon's info into
+// m.viewport and sizes it to fill the available terminal space.
+func setupBrowseDetailViewport(m model) model {
+	if m.selectedBrowseDBIdx >= len(m.addonDB) {
+		return m
+	}
+	e := m.addonDB[m.selectedBrowseDBIdx]
+	md := buildBrowseDetailMarkdown(e)
+
+	var rendered string
+	if m.glamourRenderer != nil {
+		if out, err := m.glamourRenderer.Render(md); err == nil {
+			rendered = out
+		} else {
+			rendered = md
+		}
+	} else {
+		rendered = md
+	}
+
+	// Overhead: header(8) + name+blank(2) + scroll-indicator(2) + blank+action(2) + footer(2) = 16
+	h := m.terminalHeight - 16
+	if h < 5 {
+		h = 5
+	}
+	m.viewport.SetHeight(h)
+	m.viewport.SetWidth(m.terminalWidth - 4)
+	m.viewport.SetContent(rendered)
+	m.viewport.GotoTop()
+	return m
 }
 
 // addonPath returns the AddOns directory for the given flavor

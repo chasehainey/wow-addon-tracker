@@ -5,6 +5,7 @@ import (
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
+	"github.com/charmbracelet/glamour"
 )
 
 // Theme represents a color theme
@@ -60,7 +61,8 @@ var (
 
 type TrackedAddon struct {
 	Name             string   `json:"name"`
-	GithubRepo       string   `json:"github_repo"`       // "Owner/Repo"
+	GithubRepo       string   `json:"github_repo"`            // "Owner/Repo" or "wowinterface:{ID}"
+	WoWInterfaceID   int      `json:"wowi_id,omitempty"`      // set when installed from WoWInterface
 	InstalledVersion string   `json:"installed_version"` // "v5.14.2" or ""
 	InstalledDate    string   `json:"installed_date"`    // RFC3339
 	LatestVersion    string   `json:"latest_version,omitempty"`  // last known latest release tag
@@ -95,6 +97,7 @@ type GitHubRelease struct {
 	Assets      []GitHubAsset `json:"assets"`
 	HTMLURL     string        `json:"html_url"`
 	ZipballURL  string        `json:"zipball_url"`
+	Prerelease  bool          `json:"prerelease"`
 }
 
 type GitHubAsset struct {
@@ -160,23 +163,38 @@ type addonDeletedMsg struct {
 
 type downloadTickMsg struct{}
 type autoCheckTickMsg struct{}
+type wowiRefreshMsg struct{} // triggers a background filelist refresh
 
 type dbLoadedMsg struct {
 	entries []AddonDBEntry
 	err     error
-	save    bool // true when fetched from remote — persist to local cache
 }
 
-// AddonDBEntry is a single entry in the scraped addon database
+type rssLoadedMsg struct {
+	feedType string // "hot" | "new"
+	ids      []int
+	err      error
+}
+
+
+// AddonDBEntry is a single entry in the addon database (WoWInterface or GitHub).
 type AddonDBEntry struct {
-	Repo        string   `json:"repo"`
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	Stars       int      `json:"stars"`
-	Language    string   `json:"language"`
-	Topics      []string `json:"topics"`
-	UpdatedAt   string   `json:"updated_at"`
-	ExtractAs   string   `json:"extract_as,omitempty"` // override folder name on install
+	WoWInterfaceID   int      `json:"wowi_id,omitempty"`          // WoWInterface addon ID (>0 for WoWI entries)
+	Repo             string   `json:"repo,omitempty"`             // GitHub "Owner/Repo" (non-empty for GitHub entries)
+	Name             string   `json:"name"`
+	Author           string   `json:"author,omitempty"`
+	Description      string   `json:"description,omitempty"`
+	Changelog        string   `json:"changelog,omitempty"`
+	LatestVersion    string   `json:"latest_version,omitempty"`
+	LatestDate       string   `json:"latest_date,omitempty"`
+	Downloads        int      `json:"downloads,omitempty"`
+	DownloadsMonthly int      `json:"downloads_monthly,omitempty"`
+	Favorites        int      `json:"favorites,omitempty"`
+	CategoryID       int      `json:"category_id,omitempty"`
+	DownloadURL      string   `json:"download_url,omitempty"`
+	FileInfoURL      string   `json:"file_info_url,omitempty"`   // WoWInterface addon page URL
+	Compatibility    []string `json:"compatibility,omitempty"`   // game version strings e.g. ["12.0.0","4.4.0"]
+	ExtractAs        string   `json:"extract_as,omitempty"`
 }
 
 // --- model struct ---
@@ -248,7 +266,8 @@ type model struct {
 	textInputSettingsToken   textinput.Model
 
 	// Addon DB
-	addonDB []AddonDBEntry
+	addonDB        []AddonDBEntry
+	dbRefreshing   bool // true while background filelist refresh is in-flight
 
 	// Typeahead (add-addon flow)
 	dbSuggestions   []AddonDBEntry
@@ -262,6 +281,18 @@ type model struct {
 	textInputBrowseFilter textinput.Model
 	browseDBIndices       []int
 	browseDBSelected      map[int]struct{} // db entry indices
+	browseTab             string           // "all" | "hot" | "new"
+	hotIDs                []int            // WoWI IDs from hot.xml, in order
+	latestIDs             []int            // WoWI IDs from latest.xml, in order
+	rssHotLoaded          bool             // true once hot.xml response has arrived
+	rssNewLoaded          bool             // true once latest.xml response has arrived
+
+	// Browse flavor filter (independent of installed flavor)
+	browseFlavor string // "retail" | "classic"
+
+	// Browse addon detail view
+	viewBrowseDetail    bool
+	selectedBrowseDBIdx int // index into addonDB
 
 	// Browse batch install
 	browseInstallConfirm bool
@@ -269,6 +300,13 @@ type model struct {
 	browseInstalling     bool
 	browseInstallQueue   []string
 	browseInstallIdx     int
+
+	// Quit confirmation popup
+	confirmQuit      bool
+	quitConfirmFocus string // "no" | "yes"
+
+	// Markdown renderer (glamour) — created once, width updated on resize.
+	glamourRenderer *glamour.TermRenderer
 
 	// Global UI
 	loading        bool

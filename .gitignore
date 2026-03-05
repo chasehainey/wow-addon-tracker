@@ -1,7 +1,7 @@
 wow-addon-tracker
 wow-addon-tracker.exe
-bootstrap-db
-prune-db
+/bootstrap-db
+/prune-db
 *.tmp
 reports/
 cmd/bootstrap-db/bootstrap-db

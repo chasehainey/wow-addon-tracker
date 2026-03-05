@@ -1,584 +1,390 @@
-// bootstrap-db builds assets/addon-db.json by merging four sources:
+// bootstrap-db builds assets/addon-db.json by fetching all WoW addons from
+// the public MMOUI / WoWInterface API.
 //
-//  1. The community addon catalogue CSV (layday/github-wow-addon-catalogue)
-//  2. All repos tagged with the `world-of-warcraft` GitHub topic
-//  3. CurseForge top-200 addons by downloads (requires CURSEFORGE_API_KEY)
-//  4. WoWInterface top-200 addons by downloads (no auth required)
-//
-// Sources 3 and 4 contribute only entries where the addon page links to a
-// GitHub repository — any addon that doesn't publish its source on GitHub is
-// silently skipped.
+// Strategy:
+//  1. Fetch the full addon list (one request, ~7 500 addons).
+//  2. Batch-fetch details in groups of 100 to get descriptions and exact
+//     download URIs (~80 requests total, run concurrently).
+//  3. Merge, strip BBCode markup from descriptions, sort by downloads, write.
 //
 // Usage (from repo root):
 //
 //	go run ./cmd/bootstrap-db
 //
-// Requires a GitHub token in GITHUB_TOKEN env var or saved in the app config
-// at ~/.config/wow-addon-tracker/config.json.
-// Optional: set CURSEFORGE_API_KEY to include CurseForge results.
+// Output: assets/addon-db.json
 package main
 
 import (
-	"encoding/csv"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
-	"runtime"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
 const (
-	catalogueURL  = "https://raw.githubusercontent.com/layday/github-wow-addon-catalogue/refs/heads/main/addons.csv"
-	apiBase       = "https://api.github.com"
-	enrichWorkers = 20
+	filelistURL = "https://api.mmoui.com/v4/game/WOW/filelist.json"
+	detailsBase = "https://api.mmoui.com/v4/game/WOW/filedetails/"
+	batchSize   = 100
+	workers     = 15
 )
 
+// ── MMOUI API types ──────────────────────────────────────────────────────────
+
+type filelistEntry struct {
+	ID               int      `json:"id"`
+	CategoryID       int      `json:"categoryId"`
+	Version          string   `json:"version"`
+	LastUpdate       int64    `json:"lastUpdate"` // Unix ms
+	Title            string   `json:"title"`
+	Author           string   `json:"author"`
+	Downloads        int      `json:"downloads"`
+	DownloadsMonthly int      `json:"downloadsMonthly"`
+	Favorites        int      `json:"favorites"`
+	GameVersions     []string `json:"gameVersions"`
+	FileInfoURI      string   `json:"fileInfoUri"`
+}
+
+type detailEntry struct {
+	ID               int    `json:"id"`
+	Title            string `json:"title"`
+	Author           string `json:"author"`
+	Description      string `json:"description"`
+	ChangeLog        string `json:"changeLog"`
+	Version          string `json:"version"`
+	LastUpdate       int64  `json:"lastUpdate"`
+	DownloadURI      string `json:"downloadUri"`
+	CategoryID       int    `json:"categoryId"`
+	DownloadsMonthly int    `json:"downloadsMonthly"`
+}
+
+// ── Output type (must match app's types.go AddonDBEntry JSON tags) ───────────
+
 type AddonDBEntry struct {
-	Repo        string   `json:"repo"`
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	Stars       int      `json:"stars"`
-	Language    string   `json:"language"`
-	Topics      []string `json:"topics"`
-	UpdatedAt   string   `json:"updated_at"`
+	WoWInterfaceID   int      `json:"wowi_id"`
+	Name             string   `json:"name"`
+	Author           string   `json:"author,omitempty"`
+	Description      string   `json:"description,omitempty"`
+	Changelog        string   `json:"changelog,omitempty"`
+	LatestVersion    string   `json:"latest_version,omitempty"`
+	LatestDate       string   `json:"latest_date,omitempty"`
+	Downloads        int      `json:"downloads,omitempty"`
+	DownloadsMonthly int      `json:"downloads_monthly,omitempty"`
+	Favorites        int      `json:"favorites,omitempty"`
+	CategoryID       int      `json:"category_id,omitempty"`
+	DownloadURL      string   `json:"download_url,omitempty"`
+	FileInfoURL      string   `json:"file_info_url,omitempty"`
+	Compatibility    []string `json:"compatibility,omitempty"`
 }
 
-type appConfig struct {
-	GithubToken string `json:"github_token"`
-}
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
-type ghSearchResponse struct {
-	TotalCount int            `json:"total_count"`
-	Items      []ghSearchItem `json:"items"`
-}
+// BBCode → Markdown conversion regexps (compiled once at startup).
+var (
+	reListBlock = regexp.MustCompile(`(?is)\[list(=\d+)?\](.*?)\[/list\]`)
+	reListItem  = regexp.MustCompile(`(?i)\[\*\]`)
+	reSizeTag   = regexp.MustCompile(`(?is)\[size=(\d+)\](.*?)\[/size\]`)
+	reBoldTag   = regexp.MustCompile(`(?is)\[b\](.*?)\[/b\]`)
+	reItalicTag = regexp.MustCompile(`(?is)\[i\](.*?)\[/i\]`)
+	reUnderTag  = regexp.MustCompile(`(?is)\[u\](.*?)\[/u\]`)
+	reStrikeTag = regexp.MustCompile(`(?is)\[s\](.*?)\[/s\]`)
+	reCodeTag   = regexp.MustCompile(`(?is)\[code\](.*?)\[/code\]`)
+	reURLTag1   = regexp.MustCompile(`(?is)\[url=([^\]]+)\](.*?)\[/url\]`)
+	reURLTag2   = regexp.MustCompile(`(?is)\[url\](.*?)\[/url\]`)
+	reIMGTag    = regexp.MustCompile(`(?is)\[img\](.*?)\[/img\]`)
+	reColorTag  = regexp.MustCompile(`(?is)\[color=[^\]]+\](.*?)\[/color\]`)
+	reQuoteTag  = regexp.MustCompile(`(?is)\[quote(?:=[^\]]*)?\](.*?)\[/quote\]`)
+	reIndentTag = regexp.MustCompile(`(?is)\[indent\](.*?)\[/indent\]`)
+	reAnyTag    = regexp.MustCompile(`\[/?[^\]\s=]+(?:=[^\]]*)?\]`)
+)
 
-type ghSearchItem struct {
-	FullName        string   `json:"full_name"`
-	Name            string   `json:"name"`
-	Description     string   `json:"description"`
-	StargazersCount int      `json:"stargazers_count"`
-	Language        string   `json:"language"`
-	Topics          []string `json:"topics"`
-	UpdatedAt       string   `json:"updated_at"`
-}
+// bbcodeToMarkdown converts WoWInterface BBCode markup to Markdown.
+func bbcodeToMarkdown(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
 
-type ghRepoResp struct {
-	StargazersCount int    `json:"stargazers_count"`
-	Language        string `json:"language"`
-}
-
-// ── CurseForge types ─────────────────────────────────────────────────────────
-
-type cfResponse struct {
-	Data []cfMod `json:"data"`
-}
-
-type cfMod struct {
-	Name  string  `json:"name"`
-	Links cfLinks `json:"links"`
-}
-
-type cfLinks struct {
-	SourceUrl  string `json:"sourceUrl"`
-	WebsiteUrl string `json:"websiteUrl"`
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-func readToken() string {
-	if t := os.Getenv("GITHUB_TOKEN"); t != "" {
-		return t
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	data, err := os.ReadFile(filepath.Join(home, ".config", "wow-addon-tracker", "config.json"))
-	if err != nil {
-		return ""
-	}
-	var cfg appConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return ""
-	}
-	return cfg.GithubToken
-}
-
-func apiGet(url, token string) ([]byte, int, error) {
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, 0, err
-	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	req.Header.Set("User-Agent", "wow-addon-tracker-bootstrap/1.0")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	return body, resp.StatusCode, err
-}
-
-// extractGitHubRepo extracts "Owner/Repo" from any string containing a
-// github.com URL.  Returns "" if no valid repo path is found.
-func extractGitHubRepo(s string) string {
-	if s == "" {
-		return ""
-	}
-	lower := strings.ToLower(s)
-	idx := strings.Index(lower, "github.com/")
-	if idx < 0 {
-		return ""
-	}
-	rest := s[idx+len("github.com/"):]
-	// Split into owner / repo / optional-extra
-	parts := strings.SplitN(rest, "/", 3)
-	if len(parts) < 2 {
-		return ""
-	}
-	owner := cleanSegment(parts[0])
-	repo := strings.TrimSuffix(cleanSegment(parts[1]), ".git")
-	if owner == "" || repo == "" {
-		return ""
-	}
-	// Skip obviously non-repo paths like github.com/orgs/... or github.com/search
-	if strings.EqualFold(owner, "orgs") || strings.EqualFold(owner, "search") ||
-		strings.EqualFold(owner, "topics") || strings.EqualFold(owner, "explore") {
-		return ""
-	}
-	return owner + "/" + repo
-}
-
-func cleanSegment(s string) string {
-	for _, ch := range []string{"?", "#", " ", "\t", "\n", "\r", "\"", "'"} {
-		if i := strings.Index(s, ch); i >= 0 {
-			s = s[:i]
-		}
-	}
-	return s
-}
-
-// ── Sources ───────────────────────────────────────────────────────────────────
-
-// fetchCatalogue downloads and parses the community catalogue CSV.
-func fetchCatalogue() ([]AddonDBEntry, error) {
-	fmt.Println("→ Fetching community catalogue CSV...")
-	resp, err := http.Get(catalogueURL)
-	if err != nil {
-		return nil, fmt.Errorf("fetch catalogue: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("catalogue HTTP %d", resp.StatusCode)
-	}
-	r := csv.NewReader(resp.Body)
-	records, err := r.ReadAll()
-	if err != nil {
-		return nil, fmt.Errorf("parse CSV: %w", err)
-	}
-	var out []AddonDBEntry
-	for i, row := range records {
-		if i == 0 {
-			continue
-		}
-		if len(row) < 6 {
-			continue
-		}
-		fullName := strings.TrimSpace(row[2])
-		if fullName == "" || !strings.Contains(fullName, "/") {
-			continue
-		}
-		out = append(out, AddonDBEntry{
-			Repo:        fullName,
-			Name:        row[1],
-			Description: row[4],
-			UpdatedAt:   row[5],
-		})
-	}
-	fmt.Printf("   %d entries\n", len(out))
-	return out, nil
-}
-
-// fetchTopicRepos scrapes all repos for a GitHub topic via the Search API.
-func fetchTopicRepos(topic, token string) ([]AddonDBEntry, error) {
-	fmt.Printf("→ Scraping topic:%s via GitHub Search API...\n", topic)
-	var all []AddonDBEntry
-	seen := make(map[string]bool)
-
-	for page := 1; page <= 10; page++ {
-		url := fmt.Sprintf("%s/search/repositories?q=topic:%s&sort=stars&order=desc&per_page=100&page=%d",
-			apiBase, topic, page)
-		body, status, err := apiGet(url, token)
-		if err != nil {
-			return nil, fmt.Errorf("search API (page %d): %w", page, err)
-		}
-		if status == 422 {
-			break // past GitHub's 1000-result window
-		}
-		if status != 200 {
-			return nil, fmt.Errorf("search API HTTP %d: %s", status, string(body))
-		}
-		var result ghSearchResponse
-		if err := json.Unmarshal(body, &result); err != nil {
-			return nil, fmt.Errorf("parse search response: %w", err)
-		}
-		if len(result.Items) == 0 {
-			break
-		}
-		for _, item := range result.Items {
-			if seen[item.FullName] {
+	// Lists (multiline — must run before inline tags).
+	s = reListBlock.ReplaceAllStringFunc(s, func(m string) string {
+		sub := reListBlock.FindStringSubmatch(m)
+		ordered := sub[1] != ""
+		items := reListItem.Split(sub[2], -1)
+		var lines []string
+		num := 1
+		for _, item := range items {
+			item = strings.TrimSpace(item)
+			if item == "" {
 				continue
 			}
-			seen[item.FullName] = true
-			all = append(all, AddonDBEntry{
-				Repo:        item.FullName,
-				Name:        item.Name,
-				Description: item.Description,
-				Stars:       item.StargazersCount,
-				Language:    item.Language,
-				Topics:      item.Topics,
-				UpdatedAt:   item.UpdatedAt,
-			})
-		}
-		fmt.Printf("   page %d: %d results (total so far: %d)\n", page, len(result.Items), len(all))
-		if len(result.Items) < 100 {
-			break
-		}
-		time.Sleep(300 * time.Millisecond)
-	}
-	return all, nil
-}
-
-// fetchCurseForge queries the CurseForge API for the top-200 WoW addons by
-// download count and returns entries for those that include a GitHub link in
-// their sourceUrl or websiteUrl fields.
-//
-// Requires a CurseForge API key (free tier from console.curseforge.com).
-func fetchCurseForge(apiKey string) ([]AddonDBEntry, error) {
-	fmt.Println("→ Fetching CurseForge top-200 addons...")
-	var out []AddonDBEntry
-	seen := make(map[string]bool)
-
-	// gameId=1 (World of Warcraft), classId=6 (AddOns), sortField=6 (TotalDownloads)
-	for page := 0; page < 4; page++ {
-		index := page * 50
-		url := fmt.Sprintf(
-			"https://api.curseforge.com/v1/mods/search?gameId=1&classId=6&sortField=6&sortOrder=desc&pageSize=50&index=%d",
-			index)
-		req, err := http.NewRequest("GET", url, nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("x-api-key", apiKey)
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("User-Agent", "wow-addon-tracker-bootstrap/1.0")
-
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("CurseForge page %d: %w", page+1, err)
-		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		if resp.StatusCode != 200 {
-			return nil, fmt.Errorf("CurseForge API HTTP %d: %s", resp.StatusCode, string(body))
-		}
-
-		var result cfResponse
-		if err := json.Unmarshal(body, &result); err != nil {
-			return nil, fmt.Errorf("CurseForge parse page %d: %w", page+1, err)
-		}
-
-		found := 0
-		for _, mod := range result.Data {
-			gh := extractGitHubRepo(mod.Links.SourceUrl)
-			if gh == "" {
-				gh = extractGitHubRepo(mod.Links.WebsiteUrl)
+			if ordered {
+				lines = append(lines, fmt.Sprintf("%d. %s", num, item))
+				num++
+			} else {
+				lines = append(lines, "- "+item)
 			}
-			if gh == "" || seen[gh] {
-				continue
-			}
-			seen[gh] = true
-			out = append(out, AddonDBEntry{Repo: gh, Name: mod.Name})
-			found++
 		}
-		fmt.Printf("   page %d: %d mods, %d with GitHub links (running total: %d)\n",
-			page+1, len(result.Data), found, len(out))
-		if len(result.Data) < 50 {
-			break
+		if len(lines) == 0 {
+			return ""
 		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	return out, nil
-}
-
-// fetchWoWInterface fetches the top-200 WoWInterface addons by download count
-// and returns entries for those whose detail page includes a GitHub link.
-// No authentication required.
-func fetchWoWInterface() ([]AddonDBEntry, error) {
-	fmt.Println("→ Fetching WoWInterface top-200 addons...")
-
-	resp, err := http.Get("https://api.mmoui.com/v4/game/WOW/filelist.json")
-	if err != nil {
-		return nil, fmt.Errorf("WoWInterface filelist: %w", err)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("WoWInterface filelist HTTP %d", resp.StatusCode)
-	}
-
-	var files []map[string]interface{}
-	if err := json.Unmarshal(body, &files); err != nil {
-		return nil, fmt.Errorf("WoWInterface filelist parse: %w", err)
-	}
-
-	// Sort by download count descending, take top 200.
-	sort.Slice(files, func(i, j int) bool {
-		return wowiDownloads(files[i]) > wowiDownloads(files[j])
+		return "\n" + strings.Join(lines, "\n") + "\n"
 	})
-	if len(files) > 200 {
-		files = files[:200]
+	// Standalone [*] outside a list block → bullet.
+	s = reListItem.ReplaceAllString(s, "\n- ")
+
+	// Block quotes.
+	s = reQuoteTag.ReplaceAllStringFunc(s, func(m string) string {
+		sub := reQuoteTag.FindStringSubmatch(m)
+		inner := strings.TrimSpace(sub[1])
+		lines := strings.Split(inner, "\n")
+		for i, l := range lines {
+			lines[i] = "> " + l
+		}
+		return "\n" + strings.Join(lines, "\n") + "\n"
+	})
+
+	// Size tags → headings.
+	s = reSizeTag.ReplaceAllStringFunc(s, func(m string) string {
+		sub := reSizeTag.FindStringSubmatch(m)
+		size, _ := strconv.Atoi(sub[1])
+		text := strings.TrimSpace(sub[2])
+		switch {
+		case size >= 5:
+			return "\n## " + text + "\n"
+		case size >= 4:
+			return "\n### " + text + "\n"
+		case size >= 3:
+			return "\n#### " + text + "\n"
+		default:
+			return text
+		}
+	})
+
+	// Inline formatting.
+	s = reBoldTag.ReplaceAllString(s, "**$1**")
+	s = reItalicTag.ReplaceAllString(s, "*$1*")
+	s = reUnderTag.ReplaceAllString(s, "_$1_")
+	s = reStrikeTag.ReplaceAllString(s, "~~$1~~")
+	s = reCodeTag.ReplaceAllString(s, "`$1`")
+	s = reURLTag1.ReplaceAllStringFunc(s, func(m string) string {
+		sub := reURLTag1.FindStringSubmatch(m)
+		url := strings.Trim(sub[1], `"'`)
+		text := strings.TrimSpace(sub[2])
+		if text == "" {
+			return url
+		}
+		return "[" + text + "](" + url + ")"
+	})
+	s = reURLTag2.ReplaceAllString(s, "$1")
+	s = reIMGTag.ReplaceAllString(s, "") // drop inline images
+	s = reColorTag.ReplaceAllString(s, "$1")
+	s = reIndentTag.ReplaceAllString(s, "$1")
+
+	// Strip any remaining unrecognised tags.
+	s = reAnyTag.ReplaceAllString(s, "")
+
+	// Collapse excessive blank lines.
+	for strings.Contains(s, "\n\n\n") {
+		s = strings.ReplaceAll(s, "\n\n\n", "\n\n")
 	}
-	fmt.Printf("   %d total addons in DB, scanning top 200 for GitHub links...\n", len(files))
-
-	var out []AddonDBEntry
-	seen := make(map[string]bool)
-
-	for i, f := range files {
-		uid := wowiUID(f)
-		if uid == "" {
-			continue
-		}
-		dr, err := http.Get(fmt.Sprintf("https://api.mmoui.com/v4/game/WOW/filedetails/%s.json", uid))
-		if err != nil {
-			continue
-		}
-		detailBody, _ := io.ReadAll(dr.Body)
-		dr.Body.Close()
-
-		// Scan the entire JSON blob for any github.com URL.
-		gh := extractGitHubRepo(string(detailBody))
-		if gh == "" || seen[gh] {
-			continue
-		}
-		seen[gh] = true
-		name, _ := f["UIName"].(string)
-		out = append(out, AddonDBEntry{Repo: gh, Name: name})
-
-		if (i+1)%50 == 0 {
-			fmt.Printf("   %d / 200 checked (%d GitHub links found)\n", i+1, len(out))
-		}
-		time.Sleep(50 * time.Millisecond) // polite pacing
-	}
-	fmt.Printf("   Found %d addons with GitHub links.\n", len(out))
-	return out, nil
+	return strings.TrimSpace(s)
 }
 
-func wowiDownloads(e map[string]interface{}) int64 {
-	for _, key := range []string{"UIDownloadTotal", "UIDownloads", "UIHitCount"} {
-		if v, ok := e[key]; ok {
-			switch x := v.(type) {
-			case float64:
-				return int64(x)
-			case string:
-				n, _ := strconv.ParseInt(x, 10, 64)
-				return n
-			}
-		}
+func unixMsToDate(ms int64) string {
+	if ms == 0 {
+		return ""
 	}
-	return 0
+	return time.Unix(ms/1000, 0).UTC().Format("2006-01-02")
 }
 
-func wowiUID(e map[string]interface{}) string {
-	if v, ok := e["UID"]; ok {
-		switch x := v.(type) {
-		case float64:
-			return strconv.FormatInt(int64(x), 10)
-		case string:
-			return x
-		}
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
+func fetch(url string) ([]byte, error) {
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("User-Agent", "wow-addon-tracker-scraper/1.0")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
 	}
-	return ""
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return io.ReadAll(resp.Body)
 }
 
-// enrichStars fetches star count and language for entries that don't have them yet.
-func enrichStars(entries []AddonDBEntry, token string) []AddonDBEntry {
-	var needEnrich []int
-	for i, e := range entries {
-		if e.Stars == 0 {
-			needEnrich = append(needEnrich, i)
+// ── Fetch filelist ────────────────────────────────────────────────────────────
+
+func fetchFilelist() ([]filelistEntry, error) {
+	fmt.Print("Fetching addon filelist... ")
+	body, err := fetch(filelistURL)
+	if err != nil {
+		return nil, fmt.Errorf("filelist: %w", err)
+	}
+	var entries []filelistEntry
+	if err := json.Unmarshal(body, &entries); err != nil {
+		return nil, fmt.Errorf("filelist parse: %w", err)
+	}
+	fmt.Printf("%d addons\n", len(entries))
+	return entries, nil
+}
+
+// ── Fetch details in batches ─────────────────────────────────────────────────
+
+func fetchDetailsBatch(ids []int) ([]detailEntry, error) {
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = strconv.Itoa(id)
+	}
+	url := detailsBase + strings.Join(parts, ",") + ".json"
+	body, err := fetch(url)
+	if err != nil {
+		return nil, err
+	}
+	// API returns {"ERROR":"..."} when all IDs are invalid.
+	if len(body) > 0 && body[0] == '{' {
+		return nil, nil
+	}
+	var entries []detailEntry
+	if err := json.Unmarshal(body, &entries); err != nil {
+		return nil, fmt.Errorf("details parse: %w", err)
+	}
+	return entries, nil
+}
+
+func fetchAllDetails(ids []int) (map[int]detailEntry, int) {
+	// Split into batches.
+	var batches [][]int
+	for i := 0; i < len(ids); i += batchSize {
+		end := i + batchSize
+		if end > len(ids) {
+			end = len(ids)
 		}
+		batches = append(batches, ids[i:end])
 	}
-	if len(needEnrich) == 0 {
-		fmt.Println("→ All entries already have star counts, skipping enrichment.")
-		return entries
+
+	fmt.Printf("Fetching details (%d batches, %d workers)...\n", len(batches), workers)
+
+	type result struct {
+		entries []detailEntry
+		err     error
 	}
-	fmt.Printf("→ Enriching %d entries with star counts (%d workers)...\n",
-		len(needEnrich), enrichWorkers)
+	results := make([]result, len(batches))
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	var done int64
 
-	var (
-		mu      sync.Mutex
-		wg      sync.WaitGroup
-		sem     = make(chan struct{}, enrichWorkers)
-		done    atomic.Int32
-		errored atomic.Int32
-	)
-
-	for _, idx := range needEnrich {
+	for i, batch := range batches {
 		wg.Add(1)
-		go func(i int) {
+		go func(i int, batch []int) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-
-			body, status, err := apiGet(fmt.Sprintf("%s/repos/%s", apiBase, entries[i].Repo), token)
-			n := done.Add(1)
-			if err != nil || status != 200 {
-				errored.Add(1)
-			} else {
-				var r ghRepoResp
-				if err := json.Unmarshal(body, &r); err == nil {
-					mu.Lock()
-					entries[i].Stars = r.StargazersCount
-					entries[i].Language = r.Language
-					mu.Unlock()
-				}
+			entries, err := fetchDetailsBatch(batch)
+			results[i] = result{entries: entries, err: err}
+			done++
+			if done%10 == 0 || int(done) == len(batches) {
+				fmt.Printf("  %d/%d batches\n", done, len(batches))
 			}
-			if n%100 == 0 || int(n) == len(needEnrich) {
-				fmt.Printf("   %d / %d  (%d errors)\n", n, len(needEnrich), errored.Load())
-			}
-		}(idx)
+		}(i, batch)
 	}
 	wg.Wait()
-	fmt.Printf("   Done. %d errors.\n", errored.Load())
-	return entries
+
+	byID := make(map[int]detailEntry)
+	errCount := 0
+	for _, r := range results {
+		if r.err != nil {
+			errCount++
+			continue
+		}
+		for _, e := range r.entries {
+			byID[e.ID] = e
+		}
+	}
+	return byID, errCount
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 func main() {
-	token := readToken()
-	if token == "" {
-		fmt.Fprintln(os.Stderr, "No GitHub token found.")
-		fmt.Fprintln(os.Stderr, "Set GITHUB_TOKEN=ghp_xxx or add a token via the app's Settings → GitHub Token.")
+	output := flag.String("out", "assets/addon-db.json", "output path")
+	flag.Parse()
+
+	// 1. Filelist.
+	filelistEntries, err := fetchFilelist()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Println("GitHub token: found")
 
-	cfKey := os.Getenv("CURSEFORGE_API_KEY")
-	if cfKey != "" {
-		fmt.Println("CurseForge key: found")
-	} else {
-		fmt.Println("CurseForge key: not set (set CURSEFORGE_API_KEY to include CurseForge results)")
+	// Build ID slice and lookup map.
+	ids := make([]int, len(filelistEntries))
+	byID := make(map[int]filelistEntry, len(filelistEntries))
+	for i, e := range filelistEntries {
+		ids[i] = e.ID
+		byID[e.ID] = e
 	}
-	fmt.Println()
 
-	seen := make(map[string]int) // repo → index in merged
-	merged := make([]AddonDBEntry, 0, 3000)
+	// 2. Details.
+	detailsByID, errCount := fetchAllDetails(ids)
+	fmt.Printf("  %d details fetched, %d batch errors\n", len(detailsByID), errCount)
 
-	addSource := func(entries []AddonDBEntry, label string) {
-		added := 0
-		for _, e := range entries {
-			if _, exists := seen[e.Repo]; !exists {
-				seen[e.Repo] = len(merged)
-				merged = append(merged, e)
-				added++
+	// 3. Merge.
+	out := make([]AddonDBEntry, 0, len(filelistEntries))
+	for _, fl := range filelistEntries {
+		entry := AddonDBEntry{
+			WoWInterfaceID:   fl.ID,
+			Name:             fl.Title,
+			Author:           fl.Author,
+			LatestVersion:    fl.Version,
+			LatestDate:       unixMsToDate(fl.LastUpdate),
+			Downloads:        fl.Downloads,
+			DownloadsMonthly: fl.DownloadsMonthly,
+			Favorites:        fl.Favorites,
+			CategoryID:       fl.CategoryID,
+			DownloadURL:      fmt.Sprintf("https://cdn.wowinterface.com/downloads/getfile.php?id=%d", fl.ID),
+			FileInfoURL:      fl.FileInfoURI,
+			Compatibility:    fl.GameVersions,
+		}
+		if d, ok := detailsByID[fl.ID]; ok {
+			entry.Description = bbcodeToMarkdown(d.Description)
+			entry.Changelog = bbcodeToMarkdown(d.ChangeLog)
+			// Prefer monthly downloads from details when available.
+			if d.DownloadsMonthly > 0 {
+				entry.DownloadsMonthly = d.DownloadsMonthly
+			}
+			// Use the exact downloadUri from the API when available; it
+			// resolves correctly for the current file version.
+			if d.DownloadURI != "" {
+				entry.DownloadURL = d.DownloadURI
 			}
 		}
-		fmt.Printf("   +%d new  (%d total)\n", added, len(merged))
-		_ = label
-	}
-
-	// 1. Community catalogue CSV
-	catalogueEntries, err := fetchCatalogue()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-
-	// 2. GitHub topic search (stars included in results — add first so they
-	//    take precedence over catalogue entries for the same repo)
-	fmt.Println()
-	topicEntries, err := fetchTopicRepos("world-of-warcraft", token)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-
-	// 3. CurseForge (optional)
-	var cfEntries []AddonDBEntry
-	if cfKey != "" {
-		fmt.Println()
-		cfEntries, err = fetchCurseForge(cfKey)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "CurseForge scrape error (continuing): %v\n", err)
+		// Omit placeholder changelog value from the API.
+		if entry.Changelog == "None" {
+			entry.Changelog = ""
 		}
+		out = append(out, entry)
 	}
 
-	// 4. WoWInterface
-	fmt.Println()
-	wowiEntries, err := fetchWoWInterface()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "WoWInterface scrape error (continuing): %v\n", err)
-	}
-
-	// Merge — topic search first (richest metadata), then the rest
-	fmt.Println()
-	fmt.Println("→ Merging sources...")
-	fmt.Print("   GitHub topics:        ")
-	addSource(topicEntries, "topics")
-	fmt.Print("   Community catalogue:  ")
-	addSource(catalogueEntries, "catalogue")
-	if cfKey != "" {
-		fmt.Print("   CurseForge:           ")
-		addSource(cfEntries, "curseforge")
-	}
-	fmt.Print("   WoWInterface:         ")
-	addSource(wowiEntries, "wowinterface")
-
-	// 5. Enrich entries that don't have star counts yet
-	fmt.Println()
-	merged = enrichStars(merged, token)
-
-	// 6. Sort by stars descending
-	sort.Slice(merged, func(i, j int) bool {
-		return merged[i].Stars > merged[j].Stars
+	// Sort by downloads descending so the most-used addons appear first.
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Downloads > out[j].Downloads
 	})
 
-	// 7. Write output
-	data, err := json.MarshalIndent(merged, "", "  ")
+	// 4. Write.
+	data, err := json.MarshalIndent(out, "", "  ")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "JSON marshal failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "marshal error: %v\n", err)
 		os.Exit(1)
 	}
-
-	_, file, _, _ := runtime.Caller(0)
-	repoRoot := filepath.Join(filepath.Dir(file), "..", "..")
-	outPath := filepath.Join(repoRoot, "assets", "addon-db.json")
-
-	if err := os.WriteFile(outPath, data, 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "write failed: %v\n", err)
+	if err := os.WriteFile(*output, data, 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "write error: %v\n", err)
 		os.Exit(1)
 	}
-
-	fmt.Printf("\n✓ Wrote %d entries → %s\n", len(merged), outPath)
-	fmt.Println("\nTop 15 by stars:")
-	for i := 0; i < 15 && i < len(merged); i++ {
-		fmt.Printf("  %2d.  %-52s  %d ★\n", i+1, merged[i].Repo, merged[i].Stars)
-	}
-	fmt.Println("\nRun `go build ./...` to embed the updated database into the binary.")
+	fmt.Printf("Wrote %d addons to %s (%.1f MB)\n", len(out), *output, float64(len(data))/1e6)
 }
